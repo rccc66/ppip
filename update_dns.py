@@ -168,8 +168,8 @@ def check_proxy_ips():
                 ip_status[ip] = "invalid"
                 print(f"  ❌ {ip} 无效")
         except Exception as e:
-            ip_status[ip] = "error"
-            print(f"  ⚠️ {ip} 检测出错: {e}")
+            ip_status[ip] = "invalid"
+            print(f"  ❌ {ip} 检测出错，标记为无效: {e}")
         time.sleep(1)
 
     return ip_status
