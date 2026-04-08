@@ -3,6 +3,7 @@ import requests
 import base64
 import time
 import re
+import random
 from bs4 import BeautifulSoup
 
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
@@ -12,56 +13,100 @@ CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 FOFA_COOKIE = os.getenv("FOFA_COOKIE")
 
-FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country="US"'
+FOFA_QUERY = 'server=="cloudflare" && header=="Forbidden" && asn=="31898" && country=="US"'
 PROXY_CHECK_URL = "https://pp.rr66.workers.dev"
-
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 
 ABUSE_THRESHOLD = 20
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://fofa.info/",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-GPC": "1"
-}
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+]
 
 
 def fofa_search():
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = f"https://fofa.info/result?qbase64={qbase64}"
-    headers = HEADERS.copy()
-    headers["Cookie"] = FOFA_COOKIE
-    print(f"请求 FOFA: {url}")
+
+    session = requests.Session()
+
+    # 先访问首页，模拟正常浏览
+    ua = random.choice(USER_AGENTS)
+    session.headers.update({
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,en-US;q=0.6,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-GPC": "1"
+    })
+
+    # 设置 Cookie
+    for item in FOFA_COOKIE.split("; "):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            session.cookies.set(k.strip(), v.strip(), domain="fofa.info")
+
+    print("先访问 FOFA 首页...")
+    try:
+        session.get("https://fofa.info/", timeout=30)
+    except:
+        pass
+
+    # 随机等待 2-5 秒，模拟人类
+    delay = random.uniform(2, 5)
+    print(f"等待 {delay:.1f} 秒...")
+    time.sleep(delay)
+
+    # 搜索
+    session.headers.update({
+        "Referer": "https://fofa.info/",
+        "Sec-Fetch-Site": "same-origin",
+    })
+
+    print(f"请求搜索: {url}")
 
     resp = None
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=headers, timeout=60)
+            resp = session.get(url, timeout=60)
             resp.raise_for_status()
             break
         except requests.exceptions.ReadTimeout:
             print(f"超时，第 {attempt+1}/3 次重试...")
             if attempt == 2:
                 return []
-            time.sleep(5)
+            time.sleep(random.uniform(3, 8))
         except Exception as e:
             print(f"请求失败: {e}")
             if attempt == 2:
                 return []
-            time.sleep(5)
+            time.sleep(random.uniform(3, 8))
 
     if resp is None:
         return []
 
+    # 检查是否被重定向到登录页
+    if "login" in resp.url.lower():
+        print("Cookie 失效，被重定向到登录页")
+        print("请更新 GitHub Secrets 中的 FOFA_COOKIE")
+        return []
+
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    if soup.find("input", {"id": "username"}):
+        print("返回了登录页面，Cookie 已过期")
+        return []
+
     ips = []
     for div in soup.find_all("div", class_="hsxa-ip"):
         for a in div.find_all("a", class_="hsxa-jump-a"):
@@ -127,29 +172,21 @@ def cleanup_failed_ips():
     print(f"当前 DNS 中的 IP ({len(all_ips)} 个): {all_ips}\n")
 
     failed_ips = []
-
-    # 逐个检测每个 IP
     for ip in all_ips:
         try:
             check_url = f"{PROXY_CHECK_URL}/check?proxyip={ip}:443"
             resp = requests.get(check_url, timeout=30)
             resp.raise_for_status()
-
             data = resp.json()
-            success = data.get("success", False)
-            response_time = data.get("responseTime", -1)
-            message = data.get("message", "")
 
-            if success:
-                print(f"✅ {ip} 有效 ({response_time}ms)")
+            if data.get("success"):
+                print(f"✅ {ip} 有效 ({data.get('responseTime')}ms)")
             else:
-                print(f"❌ {ip} 无效 - {message}")
+                print(f"❌ {ip} 无效 - {data.get('message')}")
                 failed_ips.append(ip)
-
         except Exception as e:
             print(f"❌ {ip} 检测出错: {e}")
             failed_ips.append(ip)
-
         time.sleep(1)
 
     if not failed_ips:
