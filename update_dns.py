@@ -7,8 +7,8 @@ FOFA_API_KEY = os.getenv("FOFA_API_KEY")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CF_ZONE_ID = os.getenv("CLOUDFLARE_ZONE_ID")
-CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")  # 默认 us.example.com
-CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")  # 你的主域名，比如 example.com
+CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
+CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 
 FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country="US"'
 FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
@@ -32,6 +32,9 @@ def fofa_search():
     resp = requests.get(FOFA_SEARCH_URL, params=params)
     resp.raise_for_status()
     data = resp.json()
+
+    print(f"FOFA 返回数据: {data}")
+
     if not data.get("results"):
         return []
     ips = [item[0] for item in data["results"] if item and item[0]]
@@ -73,18 +76,16 @@ def create_or_update_dns(ip):
     }
     record_name = f"{CF_DNS_NAME}.{CF_DOMAIN}"
 
-    # 先查看是否已有当前 IP 的记录
     existing = get_existing_record(ip)
     if existing:
         print(f"IP {ip} 已有对应 DNS 记录，无需新增")
         return
-    
-    # 新增记录
+
     data = {
         "type": "A",
         "name": record_name,
         "content": ip,
-        "ttl": 120,  # 2分钟 ttl
+        "ttl": 120,
         "proxied": False
     }
     resp = requests.post(CF_DNS_RECORDS_URL, headers=headers, json=data)
@@ -96,14 +97,14 @@ def main():
     print("开始从FOFA搜索IP...")
     ips = fofa_search()
     print(f"找到IP: {ips}")
-    
+
     clean_ips = []
     for ip in ips:
         score = abuseipdb_check(ip)
         print(f"IP {ip} 的 AbuseIPDB 评分: {score}")
         if score < ABUSE_THRESHOLD:
             clean_ips.append(ip)
-    
+
     print(f"纯净IP列表: {clean_ips}")
 
     for ip in clean_ips:
