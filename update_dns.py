@@ -136,24 +136,22 @@ def delete_dns_record(record_id, ip):
     print(f"已删除 DNS 记录: {ip}")
 
 
-# ========== ProxyIP 检测并清理 ==========
-def cleanup_failed_ips():
-    fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    print(f"\n===== 第四步：检测 ProxyIP 并清理失败记录 =====")
+# ========== ProxyIP 检测 ==========
+def check_proxy_ips():
+    print(f"\n===== 第四步：检测 ProxyIP =====")
     print("等待 30 秒让 DNS 生效...")
     time.sleep(30)
 
     records = get_dns_records()
     if not records:
         print("没有 DNS 记录需要检测")
-        return
+        return {}
 
     all_ips = [r["content"] for r in records]
     print(f"当前 DNS 中的 IP: {all_ips}")
 
-    failed_ips = []
+    ip_status = {}
 
-    # 逐个检测
     for ip in all_ips:
         try:
             check_url = f"{PROXY_CHECK_URL}/check?proxyip={ip}:443"
@@ -163,22 +161,33 @@ def cleanup_failed_ips():
             data = resp.json()
             print(f"  返回: {data}")
 
-            if not data.get("success", False):
-                failed_ips.append(ip)
-                print(f"  ❌ {ip} 无效")
-            else:
+            if data.get("success", False):
+                ip_status[ip] = "valid"
                 print(f"  ✅ {ip} 有效")
+            else:
+                ip_status[ip] = "invalid"
+                print(f"  ❌ {ip} 无效")
         except Exception as e:
-            print(f"  检测出错: {e}")
+            ip_status[ip] = "error"
+            print(f"  ⚠️ {ip} 检测出错: {e}")
         time.sleep(1)
 
-    failed_ips = list(dict.fromkeys(failed_ips))
+    return ip_status
+
+
+# ========== 清理失败 IP ==========
+def cleanup_failed_ips(ip_status):
+    print(f"\n===== 第五步：清理失败 IP =====")
+
+    failed_ips = [ip for ip, status in ip_status.items() if status == "invalid"]
 
     if not failed_ips:
         print("所有 IP 检测正常，无需清理")
         return
 
-    print(f"\n需要删除的失败 IP: {failed_ips}")
+    print(f"需要删除的失败 IP: {failed_ips}")
+
+    records = get_dns_records()
     for record in records:
         if record["content"] in failed_ips:
             try:
@@ -224,7 +233,8 @@ def main():
         except Exception as e:
             print(f"添加 DNS 失败 {ip}: {e}")
 
-    cleanup_failed_ips()
+    ip_status = check_proxy_ips()
+    cleanup_failed_ips(ip_status)
 
     print("\n===== 全部完成 =====")
 
