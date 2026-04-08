@@ -3,65 +3,129 @@ import requests
 import base64
 import time
 import re
+import ddddocr
 from bs4 import BeautifulSoup
 
+FOFA_EMAIL = os.getenv("FOFA_EMAIL")
+FOFA_PASSWORD = os.getenv("FOFA_PASSWORD")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CF_ZONE_ID = os.getenv("CLOUDFLARE_ZONE_ID")
 CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
-FOFA_COOKIE = os.getenv("FOFA_COOKIE")
 
 FOFA_QUERY = 'server=="cloudflare" && header=="Forbidden" && asn=="31898" && country=="US"'
 PROXY_CHECK_URL = "https://pp.rr66.workers.dev"
-
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 
 ABUSE_THRESHOLD = 20
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://fofa.info/",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-GPC": "1"
-}
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0"
 
 
+# ========== FOFA 自动登录 ==========
+def fofa_login():
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA})
+
+    ocr = ddddocr.DdddOcr(show_ad=False)
+
+    for attempt in range(5):
+        try:
+            print(f"登录尝试 {attempt + 1}/5...")
+
+            # 1. 获取登录页面
+            login_url = "https://i.nosec.org/login?service=https://fofa.info/f_login"
+            page = session.get(login_url, timeout=30)
+            html = page.text
+
+            # 2. 提取 token
+            token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
+            lt_match = re.search(r'name="lt" id="lt" value="([^"]+)"', html)
+
+            if not token_match or not lt_match:
+                print("获取 token 失败，重试...")
+                time.sleep(2)
+                continue
+
+            # 3. 获取验证码并 OCR
+            captcha_resp = session.get(f"https://i.nosec.org/rucaptcha/?t={int(time.time()*1000)}", timeout=15)
+            captcha_text = ocr.classification(captcha_resp.content)
+            print(f"验证码识别: {captcha_text}")
+
+            if len(captcha_text) < 4:
+                print("验证码识别结果太短，重试...")
+                time.sleep(1)
+                continue
+
+            # 4. 提交登录
+            data = {
+                "utf8": "✓",
+                "authenticity_token": token_match.group(1),
+                "lt": lt_match.group(1),
+                "service": "https://fofa.info/f_login",
+                "locale": "zh-CN",
+                "username": FOFA_EMAIL,
+                "password": FOFA_PASSWORD,
+                "_rucaptcha": captcha_text,
+                "rememberMe": "1",
+                "fofa_service": "1"
+            }
+
+            resp = session.post(
+                "https://i.nosec.org/login",
+                data=data,
+                timeout=30,
+                allow_redirects=True
+            )
+
+            # 5. 检查登录结果
+            if "fofa.info" in resp.url and "login" not in resp.url.lower():
+                print("FOFA 登录成功")
+                return session
+            else:
+                # 检查是否验证码错误
+                if "验证码" in resp.text or "captcha" in resp.text.lower():
+                    print("验证码错误，重试...")
+                else:
+                    print(f"登录失败，URL: {resp.url}")
+                time.sleep(2)
+
+        except Exception as e:
+            print(f"登录出错: {e}")
+            time.sleep(2)
+
+    print("5 次登录均失败")
+    return None
+
+
+# ========== FOFA 搜索 ==========
 def fofa_search():
+    session = fofa_login()
+    if not session:
+        return []
+
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = f"https://fofa.info/result?qbase64={qbase64}"
-    headers = HEADERS.copy()
-    headers["Cookie"] = FOFA_COOKIE
-    print(f"请求 FOFA: {url}")
 
-    resp = None
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, headers=headers, timeout=60)
-            resp.raise_for_status()
-            break
-        except requests.exceptions.ReadTimeout:
-            print(f"超时，第 {attempt+1}/3 次重试...")
-            if attempt == 2:
-                return []
-            time.sleep(5)
-        except Exception as e:
-            print(f"请求失败: {e}")
-            if attempt == 2:
-                return []
-            time.sleep(5)
+    print(f"搜索 FOFA: {url}")
+    time.sleep(3)
 
-    if resp is None:
+    try:
+        resp = session.get(url, timeout=60)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"搜索失败: {e}")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    # 检查是否被重定向到登录页
+    if "login" in resp.url.lower() or soup.find("input", {"id": "username"}):
+        print("搜索页被重定向到登录页，登录状态失效")
+        return []
+
     ips = []
     for div in soup.find_all("div", class_="hsxa-ip"):
         for a in div.find_all("a", class_="hsxa-jump-a"):
@@ -77,6 +141,7 @@ def fofa_search():
     return ips
 
 
+# ========== AbuseIPDB ==========
 def abuseipdb_check(ip):
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": 90}
@@ -85,6 +150,7 @@ def abuseipdb_check(ip):
     return resp.json()["data"]["abuseConfidenceScore"]
 
 
+# ========== Cloudflare DNS ==========
 def get_dns_records():
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
@@ -113,6 +179,7 @@ def delete_dns_record(record_id, ip):
     print(f"已删除 DNS 记录: {ip}")
 
 
+# ========== ProxyIP 检测 ==========
 def cleanup_failed_ips():
     print(f"\n===== 第四步：检测 ProxyIP 并清理失败记录 =====")
     print("等待 30 秒让 DNS 生效...")
@@ -128,24 +195,18 @@ def cleanup_failed_ips():
 
     failed_ips = []
 
-    # 逐个检测每个 IP
     for ip in all_ips:
         try:
             check_url = f"{PROXY_CHECK_URL}/check?proxyip={ip}:443"
             resp = requests.get(check_url, timeout=30)
             resp.raise_for_status()
-
             data = resp.json()
-            success = data.get("success", False)
-            response_time = data.get("responseTime", -1)
-            message = data.get("message", "")
 
-            if success:
-                print(f"✅ {ip} 有效 ({response_time}ms)")
+            if data.get("success"):
+                print(f"✅ {ip} 有效 ({data.get('responseTime')}ms)")
             else:
-                print(f"❌ {ip} 无效 - {message}")
+                print(f"❌ {ip} 无效 - {data.get('message')}")
                 failed_ips.append(ip)
-
         except Exception as e:
             print(f"❌ {ip} 检测出错: {e}")
             failed_ips.append(ip)
@@ -165,6 +226,7 @@ def cleanup_failed_ips():
                 print(f"删除失败 {record['content']}: {e}")
 
 
+# ========== 主流程 ==========
 def main():
     print("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
