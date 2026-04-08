@@ -2,7 +2,7 @@ name: Update Cloudflare DNS
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # 每天3点运行，UTC时间，可按需调整
+    - cron: '0 3 * * *'
   workflow_dispatch:
 
 jobs:
@@ -18,12 +18,13 @@ jobs:
           python-version: '3.x'
 
       - name: Install dependencies
-        run: pip install requests
+        run: |
+          pip install requests selenium
+          apt-get update
+          apt-get install -y chromium-browser chromium-chromedriver
 
       - name: Run DNS update script
         env:
-          FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
-          FOFA_API_KEY: ${{ secrets.FOFA_API_KEY }}
           ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
