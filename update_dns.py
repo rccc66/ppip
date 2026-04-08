@@ -34,14 +34,11 @@ HEADERS = {
 }
 
 
-# ========== FOFA 搜索 ==========
 def fofa_search():
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = f"https://fofa.info/result?qbase64={qbase64}"
-
     headers = HEADERS.copy()
     headers["Cookie"] = FOFA_COOKIE
-
     print(f"请求 FOFA: {url}")
 
     resp = None
@@ -51,9 +48,8 @@ def fofa_search():
             resp.raise_for_status()
             break
         except requests.exceptions.ReadTimeout:
-            print(f"请求超时，第 {attempt + 1}/3 次重试...")
+            print(f"超时，第 {attempt+1}/3 次重试...")
             if attempt == 2:
-                print("FOFA 请求 3 次均超时，退出")
                 return []
             time.sleep(5)
         except Exception as e:
@@ -66,12 +62,9 @@ def fofa_search():
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
     ips = []
-    ip_divs = soup.find_all("div", class_="hsxa-ip")
-    for div in ip_divs:
-        a_tags = div.find_all("a", class_="hsxa-jump-a")
-        for a in a_tags:
+    for div in soup.find_all("div", class_="hsxa-ip"):
+        for a in div.find_all("a", class_="hsxa-jump-a"):
             if a.get("style") and "display:none" in a.get("style", ""):
                 continue
             ip_text = a.get_text(strip=True)
@@ -84,7 +77,6 @@ def fofa_search():
     return ips
 
 
-# ========== AbuseIPDB 检测 ==========
 def abuseipdb_check(ip):
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": 90}
@@ -93,32 +85,21 @@ def abuseipdb_check(ip):
     return resp.json()["data"]["abuseConfidenceScore"]
 
 
-# ========== Cloudflare DNS ==========
 def get_dns_records():
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    params = {"type": "A", "name": fqdn}
-    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers, params=params, timeout=15)
+    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers, params={"type": "A", "name": fqdn}, timeout=15)
     resp.raise_for_status()
     return resp.json().get("result", [])
 
 
 def create_dns_record(ip):
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-
-    existing = get_dns_records()
-    for r in existing:
+    for r in get_dns_records():
         if r["content"] == ip:
             print(f"IP {ip} 已存在，跳过")
             return
-
     data = {"type": "A", "name": fqdn, "content": ip, "ttl": 1, "proxied": False}
     resp = requests.post(CF_DNS_RECORDS_URL, headers=headers, json=data, timeout=15)
     resp.raise_for_status()
@@ -126,17 +107,12 @@ def create_dns_record(ip):
 
 
 def delete_dns_record(record_id, ip):
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    url = f"{CF_DNS_RECORDS_URL}/{record_id}"
-    resp = requests.delete(url, headers=headers, timeout=15)
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    resp = requests.delete(f"{CF_DNS_RECORDS_URL}/{record_id}", headers=headers, timeout=15)
     resp.raise_for_status()
     print(f"已删除 DNS 记录: {ip}")
 
 
-# ========== ProxyIP 检测并清理 ==========
 def cleanup_failed_ips():
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
     print(f"\n===== 第四步：检测 ProxyIP 并清理失败记录 =====")
@@ -149,76 +125,125 @@ def cleanup_failed_ips():
         return
 
     all_ips = [r["content"] for r in records]
-    print(f"当前 DNS 中的 IP: {all_ips}")
+    print(f"当前 DNS 中的 IP ({len(all_ips)} 个): {all_ips}")
 
     failed_ips = []
 
-    # 逐个检测
-    for ip in all_ips:
-        try:
-            check_url = f"{PROXY_CHECK_URL}/check?ip={ip}&port=443"
-            print(f"检测 IP: {ip}")
-            resp = requests.get(check_url, timeout=30)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    print(f"  返回: {data}")
-                    if data.get("success") == False or data.get("valid") == False:
-                        failed_ips.append(ip)
-                        print(f"  ❌ {ip} 无效")
-                    else:
-                        print(f"  ✅ {ip} 有效")
-                except:
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    error_icons = soup.find_all(class_="status-error")
-                    if error_icons:
-                        failed_ips.append(ip)
-                        print(f"  ❌ {ip} 无效（HTML解析）")
-                    else:
-                        print(f"  ✅ {ip} 有效（HTML解析）")
-            else:
-                print(f"  检测返回状态码: {resp.status_code}")
-        except Exception as e:
-            print(f"  检测出错: {e}")
-        time.sleep(1)
+    # 用域名批量检测，尝试多种 URL 格式
+    check_urls = [
+        f"{PROXY_CHECK_URL}/check?proxyip={fqdn}",
+        f"{PROXY_CHECK_URL}/check?proxyip={fqdn}:443",
+        f"{PROXY_CHECK_URL}/api/check?proxyip={fqdn}",
+    ]
 
-    # 批量检测
-    if not failed_ips:
+    resp = None
+    for check_url in check_urls:
         try:
-            check_url = f"{PROXY_CHECK_URL}/check?proxyip={fqdn}"
-            print(f"\n批量检测: {check_url}")
-            resp = requests.get(check_url, timeout=60)
+            print(f"\n尝试检测: {check_url}")
+            resp = requests.get(check_url, timeout=120)
+            print(f"状态码: {resp.status_code}")
             if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    print(f"批量返回: {data}")
-                    if isinstance(data, dict):
-                        results = data.get("results", data.get("ips", []))
-                        if isinstance(results, list):
-                            for item in results:
-                                if isinstance(item, dict):
-                                    ip = item.get("ip", "")
-                                    ok = item.get("success", item.get("valid", True))
-                                    if not ok and ip:
-                                        failed_ips.append(ip)
-                except:
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    error_items = soup.find_all(class_="status-error")
-                    for item in error_items:
-                        parent = item.find_parent("div")
-                        if parent:
-                            copy_btn = parent.find(class_="copy-btn")
-                            if copy_btn and copy_btn.get("data-copy"):
-                                ip = copy_btn["data-copy"]
-                                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
-                                    failed_ips.append(ip)
+                print(f"返回内容前 1000 字符:\n{resp.text[:1000]}")
+                break
+            else:
+                print(f"返回: {resp.text[:500]}")
         except Exception as e:
-            print(f"批量检测出错: {e}")
+            print(f"请求失败: {e}")
+
+    if resp is None or resp.status_code != 200:
+        # GET 失败，尝试 POST
+        try:
+            print(f"\n尝试 POST 检测...")
+            post_url = f"{PROXY_CHECK_URL}/check"
+            for content_type, body in [
+                ("application/json", {"proxyip": fqdn}),
+                ("application/json", {"proxyip": f"{fqdn}:443"}),
+                ("application/json", {"ip": fqdn, "port": 443}),
+            ]:
+                print(f"POST {post_url} body={body}")
+                resp = requests.post(post_url, json=body, timeout=120)
+                print(f"状态码: {resp.status_code}")
+                if resp.status_code == 200:
+                    print(f"返回前 1000 字符:\n{resp.text[:1000]}")
+                    break
+        except Exception as e:
+            print(f"POST 失败: {e}")
+
+    if resp and resp.status_code == 200:
+        # 尝试解析 JSON
+        try:
+            data = resp.json()
+            print(f"\nJSON 解析成功: {data}")
+
+            # 情况1: 返回 results 数组
+            results = None
+            for key in ["results", "ips", "data", "ip_results"]:
+                if key in data and isinstance(data[key], list):
+                    results = data[key]
+                    break
+
+            if results:
+                for item in results:
+                    if isinstance(item, dict):
+                        ip = item.get("ip", "")
+                        ok = item.get("success", item.get("valid", item.get("status", True)))
+                        if ok == False or ok == "error" or ok == "fail" or ok == "failed":
+                            if ip:
+                                failed_ips.append(ip)
+                                print(f"  ❌ {ip} 无效")
+                            else:
+                                print(f"  ❌ 无效项（无IP）: {item}")
+                        else:
+                            print(f"  ✅ {ip} 有效")
+
+            # 情况2: 单个结果
+            elif "success" in data:
+                if data["success"] == False:
+                    ip = data.get("ip", "")
+                    if ip:
+                        failed_ips.append(ip)
+
+        except ValueError:
+            # 不是 JSON，解析 HTML
+            print("\n返回 HTML，解析中...")
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # 方法1: 查找 id 匹配 ip-status-line 的元素
+            lines = soup.find_all(id=re.compile(r'ip-status-line'))
+            if lines:
+                print(f"找到 {len(lines)} 个 ip-status-line")
+                for line in lines:
+                    error = line.find(class_="status-error")
+                    copy_btn = line.find(class_="copy-btn")
+                    if copy_btn and copy_btn.get("data-copy"):
+                        ip = copy_btn["data-copy"]
+                        if error:
+                            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                                failed_ips.append(ip)
+                                print(f"  ❌ {ip}")
+                        else:
+                            print(f"  ✅ {ip}")
+
+            # 方法2: 查找 status-error class
+            if not lines:
+                errors = soup.find_all(class_="status-error")
+                print(f"找到 {len(errors)} 个 status-error 元素")
+                for err in errors:
+                    parent = err.find_parent("div")
+                    while parent:
+                        copy_btn = parent.find(class_="copy-btn")
+                        if copy_btn and copy_btn.get("data-copy"):
+                            ip = copy_btn["data-copy"]
+                            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                                failed_ips.append(ip)
+                                print(f"  ❌ {ip}")
+                            break
+                        parent = parent.find_parent("div")
 
     failed_ips = list(dict.fromkeys(failed_ips))
 
     if not failed_ips:
-        print("所有 IP 检测正常，无需清理")
+        print("\n未检测到失败 IP，无需清理")
         return
 
     print(f"\n需要删除的失败 IP: {failed_ips}")
@@ -230,12 +255,10 @@ def cleanup_failed_ips():
                 print(f"删除失败 {record['content']}: {e}")
 
 
-# ========== 主流程 ==========
 def main():
     print("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
     print(f"找到 {len(ips)} 个IP: {ips}")
-
     if not ips:
         print("未找到任何IP")
         return
@@ -245,15 +268,14 @@ def main():
     for idx, ip in enumerate(ips, 1):
         try:
             score = abuseipdb_check(ip)
-            print(f"[{idx}/{len(ips)}] IP {ip} 评分: {score}")
+            print(f"[{idx}/{len(ips)}] {ip} 评分: {score}")
             if score < ABUSE_THRESHOLD:
                 clean_ips.append(ip)
             time.sleep(0.5)
         except Exception as e:
-            print(f"检查 IP {ip} 失败: {e}")
+            print(f"检查 {ip} 失败: {e}")
 
-    print(f"\n纯净IP（共 {len(clean_ips)} 个）: {clean_ips}")
-
+    print(f"\n纯净IP（{len(clean_ips)} 个）: {clean_ips}")
     if not clean_ips:
         print("没有纯净 IP，跳过")
         return
@@ -267,7 +289,6 @@ def main():
             print(f"添加 DNS 失败 {ip}: {e}")
 
     cleanup_failed_ips()
-
     print("\n===== 全部完成 =====")
 
 
