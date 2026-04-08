@@ -11,13 +11,13 @@ CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 FOFA_COOKIE = os.getenv("FOFA_COOKIE")
 
-FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country=="US"'
+FOFA_QUERY = 'server=="cloudflare" && header=="Forbidden" && asn=="31898" && country=="US"'
 PROXY_CHECK_URL = "https://pp.rr66.workers.dev"
 
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 
-MAX_IPS = 10
+MAX_IPS = 100
 ABUSE_THRESHOLD = 20
 
 HEADERS = {
@@ -33,28 +33,52 @@ HEADERS = {
 }
 
 
-# ========== FOFA 搜索 ==========
-def fofa_search_by_requests():
+# ========== FOFA 搜索（支持分页） ==========
+def fofa_search_all():
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
-    # 最近一周更新的IP，按更新时间排序
-    url = f"https://fofa.info/result?qbase64={qbase64}&after=7d&sort=update_time"
-
     headers = HEADERS.copy()
     headers["Cookie"] = FOFA_COOKIE
 
-    print(f"正在从 FOFA 搜索IP: {url}")
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
+    all_ips = []
+    page = 1
+    page_size = 100
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    ip_list = []
+    print(f"开始从 FOFA 分页搜索IP（最多获取 {MAX_IPS} 个）...")
 
-    for div in soup.select("div.hsxa-ip a.hsxa-jump-a")[:MAX_IPS]:
-        ip = div.text.strip()
-        if ip:
-            ip_list.append(ip)
+    while len(all_ips) < MAX_IPS:
+        url = f"https://fofa.info/result?qbase64={qbase64}&after=7d&sort=update_time&page={page}&size={page_size}"
+        print(f"FOFA 搜索第 {page} 页...")
 
-    return ip_list
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"第 {page} 页请求失败: {e}")
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        ip_nodes = soup.select("div.hsxa-ip a.hsxa-jump-a")
+        ips = [node.text.strip() for node in ip_nodes if node.text.strip()]
+
+        if not ips:
+            print("无更多IP，停止分页")
+            break
+
+        all_ips.extend(ips)
+        print(f"第 {page} 页获取 {len(ips)} 个IP，累计 {len(all_ips)} 个")
+
+        # 如果本页获取的IP少于page_size，说明没有下一页
+        if len(ips) < page_size:
+            print("已到最后一页")
+            break
+
+        page += 1
+        time.sleep(1)  # 避免请求过快
+
+    # 去重并限制数量
+    all_ips = list(dict.fromkeys(all_ips))[:MAX_IPS]
+    print(f"总共获取 {len(all_ips)} 个去重后的IP")
+    return all_ips
 
 
 # ========== AbuseIPDB 检测 ==========
@@ -151,18 +175,36 @@ def check_proxy_ip():
             print(f"POST 请求也失败: {e2}")
             return []
 
-    # 尝试解析 JSON
     failed_ips = []
+
     try:
         data = resp.json()
-        print(f"ProxyIP 检测返回 JSON: {data}")
-        # 根据返回格式解析
-        ips_data = data.get("ips", data.get("results", []))
-        for item in ips_data:
-            ip = item.get("ip", "")
-            status = item.get("status", "")
-            if status in ("error", "fail", "failed", False):
-                failed_ips.append(ip)
+        print(f"ProxyIP 检测返回: {data}")
+
+        # 检查 success 字段
+        if not data.get("success"):
+            print("检测失败，标记所有 IP 为失败")
+            records = get_all_dns_records()
+            for record in records:
+                failed_ips.append(record["content"])
+            return failed_ips
+
+        # 如果返回了 ips 列表
+        if "ips" in data:
+            for item in data.get("ips", []):
+                ip = item.get("ip", "")
+                status = item.get("status", "")
+                if status in ("error", "fail", "failed", False):
+                    failed_ips.append(ip)
+
+        # 如果返回了 results 列表
+        if "results" in data:
+            for item in data.get("results", []):
+                ip = item.get("ip", "")
+                status = item.get("status", "")
+                if status in ("error", "fail", "failed", False):
+                    failed_ips.append(ip)
+
     except ValueError:
         # 不是 JSON，尝试解析 HTML
         print("返回非 JSON，尝试解析 HTML...")
@@ -202,11 +244,10 @@ def cleanup_failed_ips():
 
 # ========== 主流程 ==========
 def main():
-    # 第一步：FOFA 搜索
-    print("===== 第一步：从 FOFA 搜索 IP（最近一周更新） =====")
+    # 第一步：FOFA 搜索（分页）
+    print("===== 第一步：从 FOFA 分页搜索 IP（最近一周更新） =====")
     try:
-        ips = fofa_search_by_requests()
-        ips = list(dict.fromkeys(ips))
+        ips = fofa_search_all()
         print(f"找到 {len(ips)} 个IP: {ips}")
     except Exception as e:
         print(f"FOFA 搜索失败: {e}")
@@ -219,16 +260,17 @@ def main():
     # 第二步：AbuseIPDB 纯净度检测
     print("\n===== 第二步：AbuseIPDB 纯净度检测 =====")
     clean_ips = []
-    for ip in ips:
+    for idx, ip in enumerate(ips, 1):
         try:
             score = abuseipdb_check(ip)
-            print(f"IP {ip} 的 AbuseIPDB 评分: {score}")
+            print(f"[{idx}/{len(ips)}] IP {ip} 的 AbuseIPDB 评分: {score}")
             if score < ABUSE_THRESHOLD:
                 clean_ips.append(ip)
+            time.sleep(0.5)  # 避免API请求过快
         except Exception as e:
             print(f"检查 IP {ip} 失败: {e}")
 
-    print(f"纯净IP列表: {clean_ips}")
+    print(f"\n纯净IP列表（共 {len(clean_ips)} 个）: {clean_ips}")
 
     if not clean_ips:
         print("没有纯净 IP，跳过 DNS 添加")
@@ -239,6 +281,7 @@ def main():
     for ip in clean_ips:
         try:
             create_dns_record(ip)
+            time.sleep(0.5)
         except Exception as e:
             print(f"添加 DNS 记录失败 {ip}: {e}")
 
