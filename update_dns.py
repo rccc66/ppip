@@ -1,9 +1,12 @@
 import os
 import requests
 import base64
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-FOFA_EMAIL = os.getenv("FOFA_EMAIL")
-FOFA_API_KEY = os.getenv("FOFA_API_KEY")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CF_ZONE_ID = os.getenv("CLOUDFLARE_ZONE_ID")
@@ -11,34 +14,53 @@ CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 
 FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country="US"'
-FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
+FOFA_SEARCH_URL = "https://fofa.info/"
 
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
-
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 
 MAX_IPS = 3
 ABUSE_THRESHOLD = 20
 
 
-def fofa_search():
-    query_b64 = base64.b64encode(FOFA_QUERY.encode()).decode()
-    params = {
-        "email": FOFA_EMAIL,
-        "key": FOFA_API_KEY,
-        "qbase64": query_b64,
-        "fields": "ip"
-    }
-    resp = requests.get(FOFA_SEARCH_URL, params=params)
-    resp.raise_for_status()
-    data = resp.json()
+def fofa_search_web():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
 
-    print(f"FOFA 返回数据: {data}")
+    driver = webdriver.Chrome(options=options)
+    ips = []
 
-    if not data.get("results"):
-        return []
-    ips = [item[0] for item in data["results"] if item and item[0]]
-    return ips[:MAX_IPS]
+    try:
+        driver.get(FOFA_SEARCH_URL)
+
+        wait = WebDriverWait(driver, 20)
+        textarea = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "textarea.fofa-search-input-textarea"))
+        )
+        textarea.clear()
+        textarea.send_keys(FOFA_QUERY)
+
+        submit = driver.find_element(By.CSS_SELECTOR, '[data-testid="home-search-submit"] button')
+        submit.click()
+
+        wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.hsxa-ip a.hsxa-jump-a")))
+
+        time.sleep(3)
+
+        ip_nodes = driver.find_elements(By.CSS_SELECTOR, "div.hsxa-ip a.hsxa-jump-a")
+
+        for ip_node in ip_nodes[:MAX_IPS]:
+            ip_text = ip_node.text.strip()
+            if ip_text:
+                ips.append(ip_text)
+
+    finally:
+        driver.quit()
+
+    return ips
 
 
 def abuseipdb_check(ip):
@@ -94,8 +116,8 @@ def create_or_update_dns(ip):
 
 
 def main():
-    print("开始从FOFA搜索IP...")
-    ips = fofa_search()
+    print("开始从FOFA网页搜索IP...")
+    ips = fofa_search_web()
     print(f"找到IP: {ips}")
 
     clean_ips = []
