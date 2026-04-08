@@ -6,6 +6,8 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
@@ -30,7 +32,8 @@ def fofa_search_web():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
-    driver = webdriver.Chrome(options=options)
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
     ips = []
 
     try:
