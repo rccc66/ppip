@@ -13,7 +13,7 @@ CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 FOFA_COOKIE = os.getenv("FOFA_COOKIE")
 
-FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country=="US"'
+FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country="US"'
 PROXY_CHECK_URL = "https://pp.rr66.workers.dev"
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
@@ -27,13 +27,12 @@ USER_AGENTS = [
 ]
 
 
+# ========== FOFA 搜索 ==========
 def fofa_search():
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = f"https://fofa.info/result?qbase64={qbase64}"
 
     session = requests.Session()
-
-    # 先访问首页，模拟正常浏览
     ua = random.choice(USER_AGENTS)
     session.headers.update({
         "User-Agent": ua,
@@ -45,36 +44,22 @@ def fofa_search():
         "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Sec-GPC": "1"
+        "Sec-Fetch-Site": "same-origin"
     })
 
-    # 设置 Cookie
-    for item in FOFA_COOKIE.split("; "):
+    for item in FOFA_COOKIE.split(";"):
+        item = item.strip()
         if "=" in item:
             k, v = item.split("=", 1)
             session.cookies.set(k.strip(), v.strip(), domain="fofa.info")
 
-    print("先访问 FOFA 首页...")
     try:
         session.get("https://fofa.info/", timeout=30)
+        time.sleep(random.uniform(2, 4))
     except:
         pass
 
-    # 随机等待 2-5 秒，模拟人类
-    delay = random.uniform(2, 5)
-    print(f"等待 {delay:.1f} 秒...")
-    time.sleep(delay)
-
-    # 搜索
-    session.headers.update({
-        "Referer": "https://fofa.info/",
-        "Sec-Fetch-Site": "same-origin",
-    })
-
-    print(f"请求搜索: {url}")
-
+    print(f"请求 FOFA: {url}")
     resp = None
     for attempt in range(3):
         try:
@@ -85,81 +70,113 @@ def fofa_search():
             print(f"超时，第 {attempt+1}/3 次重试...")
             if attempt == 2:
                 return []
-            time.sleep(random.uniform(3, 8))
+            time.sleep(5)
         except Exception as e:
             print(f"请求失败: {e}")
             if attempt == 2:
                 return []
-            time.sleep(random.uniform(3, 8))
+            time.sleep(5)
 
-    if resp is None:
+    if not resp:
         return []
 
-    # 检查是否被重定向到登录页
-    if "login" in resp.url.lower():
-        print("Cookie 失效，被重定向到登录页")
-        print("请更新 GitHub Secrets 中的 FOFA_COOKIE")
+    html = resp.text
+
+    if "登录" in html and "password" in html:
+        print("Cookie 已过期，请更新 FOFA_COOKIE")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    if soup.find("input", {"id": "username"}):
-        print("返回了登录页面，Cookie 已过期")
-        return []
+    soup = BeautifulSoup(html, "html.parser")
 
     ips = []
-    for div in soup.find_all("div", class_="hsxa-ip"):
-        for a in div.find_all("a", class_="hsxa-jump-a"):
-            if a.get("style") and "display:none" in a.get("style", ""):
+    ip_divs = soup.select("div.hsxa-ip")
+    for div in ip_divs:
+        links = div.select("a.hsxa-jump-a")
+        for link in links:
+            style = link.get("style", "")
+            if "display:none" in style or "display: none" in style:
                 continue
-            ip_text = a.get_text(strip=True)
-            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip_text):
-                ips.append(ip_text)
+            text = link.get_text(strip=True)
+            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', text):
+                ips.append(text)
                 break
 
+    print(f"从页面提取到 {len(ips)} 个IP")
     ips = list(dict.fromkeys(ips))
-    print(f"提取到 {len(ips)} 个去重IP")
+    print(f"去重后 {len(ips)} 个IP: {ips}")
     return ips
 
 
+# ========== AbuseIPDB 检测 ==========
 def abuseipdb_check(ip):
-    headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
+    headers = {
+        "Key": ABUSEIPDB_API_KEY,
+        "Accept": "application/json"
+    }
     params = {"ipAddress": ip, "maxAgeInDays": 90}
     resp = requests.get(ABUSE_CHECK_URL, headers=headers, params=params, timeout=15)
-    resp.raise_for_status()
-    return resp.json()["data"]["abuseConfidenceScore"]
+    data = resp.json()
+    return data.get("data", {}).get("abuseConfidenceScore", 0)
 
 
+# ========== Cloudflare DNS ==========
 def get_dns_records():
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers, params={"type": "A", "name": fqdn}, timeout=15)
-    resp.raise_for_status()
-    return resp.json().get("result", [])
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    params = {"type": "A", "name": fqdn}
+    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers, params=params, timeout=15)
+    data = resp.json()
+    return data.get("result", [])
 
 
 def create_dns_record(ip):
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    for r in get_dns_records():
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    records = get_dns_records()
+    for r in records:
         if r["content"] == ip:
             print(f"IP {ip} 已存在，跳过")
             return
-    data = {"type": "A", "name": fqdn, "content": ip, "ttl": 1, "proxied": False}
-    resp = requests.post(CF_DNS_RECORDS_URL, headers=headers, json=data, timeout=15)
-    resp.raise_for_status()
-    print(f"已添加 DNS: {fqdn} -> {ip}")
+
+    payload = {
+        "type": "A",
+        "name": fqdn,
+        "content": ip,
+        "ttl": 120,
+        "proxied": False
+    }
+    resp = requests.post(CF_DNS_RECORDS_URL, headers=headers, json=payload, timeout=15)
+    data = resp.json()
+    if data.get("success"):
+        print(f"添加 DNS: {fqdn} -> {ip}")
+    else:
+        print(f"添加失败 {ip}: {data.get('errors')}")
 
 
 def delete_dns_record(record_id, ip):
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
-    resp = requests.delete(f"{CF_DNS_RECORDS_URL}/{record_id}", headers=headers, timeout=15)
-    resp.raise_for_status()
-    print(f"已删除 DNS 记录: {ip}")
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    url = f"{CF_DNS_RECORDS_URL}/{record_id}"
+    resp = requests.delete(url, headers=headers, timeout=15)
+    data = resp.json()
+    if data.get("success"):
+        print(f"已删除 DNS 记录: {ip}")
+    else:
+        print(f"删除失败 {ip}: {data.get('errors')}")
 
 
+# ========== ProxyIP 检测并清理 ==========
 def cleanup_failed_ips():
-    print(f"\n===== 第四步：检测 ProxyIP 并清理失败记录 =====")
+    print("\n===== 第四步：检测 ProxyIP 并清理失败记录 =====")
     print("等待 30 秒让 DNS 生效...")
     time.sleep(30)
 
@@ -169,28 +186,31 @@ def cleanup_failed_ips():
         return
 
     all_ips = [r["content"] for r in records]
-    print(f"当前 DNS 中的 IP ({len(all_ips)} 个): {all_ips}\n")
+    print(f"当前 DNS 中的 IP ({len(all_ips)} 个): {all_ips}")
 
     failed_ips = []
-    for ip in all_ips:
+    for idx, ip in enumerate(all_ips, 1):
+        check_url = f"{PROXY_CHECK_URL}/check?proxyip={ip}:443"
         try:
-            check_url = f"{PROXY_CHECK_URL}/check?proxyip={ip}:443"
             resp = requests.get(check_url, timeout=30)
-            resp.raise_for_status()
             data = resp.json()
+            success = data.get("success", False)
+            msg = data.get("message", "")
+            rt = data.get("responseTime", -1)
 
-            if data.get("success"):
-                print(f"✅ {ip} 有效 ({data.get('responseTime')}ms)")
+            if success:
+                print(f"[{idx}/{len(all_ips)}] ✅ {ip} 有效 (响应: {rt}ms)")
             else:
-                print(f"❌ {ip} 无效 - {data.get('message')}")
+                print(f"[{idx}/{len(all_ips)}] ❌ {ip} 无效: {msg}")
                 failed_ips.append(ip)
+
+            time.sleep(1)
         except Exception as e:
-            print(f"❌ {ip} 检测出错: {e}")
+            print(f"[{idx}/{len(all_ips)}] ⚠️ {ip} 检测异常: {e}")
             failed_ips.append(ip)
-        time.sleep(1)
 
     if not failed_ips:
-        print("\n所有 IP 检测正常，无需清理")
+        print("所有 IP 检测正常，无需清理")
         return
 
     print(f"\n需要删除的失败 IP ({len(failed_ips)} 个): {failed_ips}")
@@ -202,6 +222,7 @@ def cleanup_failed_ips():
                 print(f"删除失败 {record['content']}: {e}")
 
 
+# ========== 主流程 ==========
 def main():
     print("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
