@@ -3,7 +3,11 @@ import requests
 import base64
 import time
 import re
+import urllib3
 from bs4 import BeautifulSoup
+
+# ✅ 禁用忽略证书验证时的安全警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
@@ -33,17 +37,14 @@ HEADERS = {
     "Sec-GPC": "1"
 }
 
-
 # ========== FOFA 搜索 ==========
 def fofa_search():
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = f"https://fofa.info/result?qbase64={qbase64}"
-
     headers = HEADERS.copy()
     headers["Cookie"] = FOFA_COOKIE
 
     print(f"请求 FOFA: {url}")
-
     resp = None
     for attempt in range(3):
         try:
@@ -66,7 +67,6 @@ def fofa_search():
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
     ips = []
     ip_divs = soup.find_all("div", class_="hsxa-ip")
     for div in ip_divs:
@@ -83,6 +83,29 @@ def fofa_search():
     print(f"提取到 {len(ips)} 个去重IP")
     return ips
 
+# ========== CF 反代指纹深度探测 (新增模块) ==========
+def check_cf_proxy(ip):
+    """
+    通过底层物理探针验证是否为真实的 Cloudflare 反代节点
+    """
+    # 探针 1: 访问 CF 专属路由探测点
+    try:
+        resp = requests.get(f"https://{ip}/cdn-cgi/trace", verify=False, timeout=5)
+        if "cloudflare" in resp.text.lower():
+            return True
+    except:
+        pass
+
+    # 探针 2: 访问 HTTP/HTTPS 端口提取 Server 响应头
+    for scheme in ["http", "https"]:
+        try:
+            resp = requests.head(f"{scheme}://{ip}", verify=False, timeout=5)
+            if "cloudflare" in resp.headers.get("Server", "").lower():
+                return True
+        except:
+            continue
+
+    return False
 
 # ========== AbuseIPDB 检测 ==========
 def abuseipdb_check(ip):
@@ -91,7 +114,6 @@ def abuseipdb_check(ip):
     resp = requests.get(ABUSE_CHECK_URL, headers=headers, params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()["data"]["abuseConfidenceScore"]
-
 
 # ========== Cloudflare DNS ==========
 def get_dns_records():
@@ -105,14 +127,12 @@ def get_dns_records():
     resp.raise_for_status()
     return resp.json().get("result", [])
 
-
 def create_dns_record(ip):
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json"
     }
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-
     existing = get_dns_records()
     for r in existing:
         if r["content"] == ip:
@@ -124,7 +144,6 @@ def create_dns_record(ip):
     resp.raise_for_status()
     print(f"已添加 DNS: {fqdn} -> {ip}")
 
-
 def delete_dns_record(record_id, ip):
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
@@ -135,10 +154,9 @@ def delete_dns_record(record_id, ip):
     resp.raise_for_status()
     print(f"已删除 DNS 记录: {ip}")
 
-
 # ========== ProxyIP 检测 ==========
 def check_proxy_ips():
-    print(f"\n===== 第四步：检测 ProxyIP =====")
+    print(f"\n===== 第五步：检测 ProxyIP =====")
     print("等待 30 秒让 DNS 生效...")
     time.sleep(30)
 
@@ -151,7 +169,6 @@ def check_proxy_ips():
     print(f"当前 DNS 中的 IP: {all_ips}")
 
     ip_status = {}
-
     for ip in all_ips:
         try:
             check_url = f"{PROXY_CHECK_URL}/check?proxyip={ip}:443"
@@ -174,11 +191,9 @@ def check_proxy_ips():
 
     return ip_status
 
-
 # ========== 清理失败 IP ==========
 def cleanup_failed_ips(ip_status):
-    print(f"\n===== 第五步：清理失败 IP =====")
-
+    print(f"\n===== 第六步：清理失败 IP =====")
     failed_ips = [ip for ip, status in ip_status.items() if status == "invalid"]
 
     if not failed_ips:
@@ -186,7 +201,6 @@ def cleanup_failed_ips(ip_status):
         return
 
     print(f"需要删除的失败 IP: {failed_ips}")
-
     records = get_dns_records()
     for record in records:
         if record["content"] in failed_ips:
@@ -195,7 +209,6 @@ def cleanup_failed_ips(ip_status):
                 print(f"✅ 已删除 {record['content']}")
             except Exception as e:
                 print(f"❌ 删除失败 {record['content']}: {e}")
-
 
 # ========== 主流程 ==========
 def main():
@@ -207,25 +220,41 @@ def main():
         print("未找到任何IP")
         return
 
-    print("\n===== 第二步：AbuseIPDB 纯净度检测 =====")
-    clean_ips = []
+    print("\n===== 第二步：核心鉴伪 - 探测 CF 反代特征 =====")
+    cf_ips = []
     for idx, ip in enumerate(ips, 1):
+        print(f"[{idx}/{len(ips)}] 探测 IP {ip} ...", end=" ")
+        if check_cf_proxy(ip):
+            print("✅ 确认为 CF 反代节点")
+            cf_ips.append(ip)
+        else:
+            print("⚡ 剔除: 未发现底层特征")
+            
+    print(f"\n物理验证通过的 CF 节点（共 {len(cf_ips)} 个）: {cf_ips}")
+
+    if not cf_ips:
+        print("没有可用的 CF 节点，跳过后续步骤")
+        return
+
+    print("\n===== 第三步：AbuseIPDB 纯净度检测 =====")
+    clean_ips = []
+    for idx, ip in enumerate(cf_ips, 1):
         try:
             score = abuseipdb_check(ip)
-            print(f"[{idx}/{len(ips)}] IP {ip} 评分: {score}")
+            print(f"[{idx}/{len(cf_ips)}] IP {ip} 评分: {score}")
             if score < ABUSE_THRESHOLD:
                 clean_ips.append(ip)
             time.sleep(0.5)
         except Exception as e:
             print(f"检查 IP {ip} 失败: {e}")
 
-    print(f"\n纯净IP（共 {len(clean_ips)} 个）: {clean_ips}")
+    print(f"\n高纯净度节点（共 {len(clean_ips)} 个）: {clean_ips}")
 
     if not clean_ips:
         print("没有纯净 IP，跳过")
         return
 
-    print("\n===== 第三步：添加 Cloudflare DNS 记录 =====")
+    print("\n===== 第四步：添加 Cloudflare DNS 记录 =====")
     for ip in clean_ips:
         try:
             create_dns_record(ip)
@@ -236,8 +265,7 @@ def main():
     ip_status = check_proxy_ips()
     cleanup_failed_ips(ip_status)
 
-    print("\n===== 全部完成 =====")
-
+    print("\n===== 📅 全部任务高效执行完毕 =====")
 
 if __name__ == "__main__":
     main()
