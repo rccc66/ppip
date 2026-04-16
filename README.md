@@ -26,3 +26,22 @@ CLOUDFLARE_ZONE_ID=your_zone_id
 CCLOUDFLARE_DNS_NAME=us
 CLOUDFLARE_DOMAIN=example.com
 FFOFA_COOKIE=your_fofa_cookie
+可自定义项
+以下两项可根据个人需求自行修改：
+
+1. FOFA 查询语句
+代码第 19 行：
+
+<PYTHON>
+FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country=="US"'
+你可以根据自己的需求修改 FOFA 搜索关键词。
+
+2. 代理检测地址
+代码第 20 行：
+
+<PYTHON>
+PROXY_CHECK_URL = "https://check.proxyip.cmliussss.net"
+该地址用于代理查询/检测，也可以替换为你自己的接口地址。
+
+注意事项
+除了上述说明中提到的内容外，其它部分请不要擅自修改，以免影响脚本正常运行。
