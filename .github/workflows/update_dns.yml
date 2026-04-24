@@ -10,17 +10,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.x'
+          python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests beautifulsoup4 ddddocr Pillow
+      - name: Install Chrome & Xvfb
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable xvfb
+
+      - name: Install Python dependencies
+        run: pip install requests selenium undetected-chromedriver ddddocr Pillow
 
       - name: Run DNS update script
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python update_dns.py 2>&1
         env:
           FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
           FOFA_PASSWORD: ${{ secrets.FOFA_PASSWORD }}
@@ -29,4 +37,11 @@ jobs:
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
           CLOUDFLARE_DNS_NAME: us
-        run: python update_dns.py
+
+      - name: Upload debug screenshot
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: debug-screenshot
+          path: "**/*.png"
+          if-no-files-found: ignore
