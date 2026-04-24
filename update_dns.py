@@ -7,6 +7,7 @@ import json
 import base64
 import requests
 import urllib3
+import urllib.parse
 import ddddocr
 from io import BytesIO
 from urllib.parse import urlparse
@@ -35,7 +36,6 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox
 LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f_login"
 
 
-# ========== 验证码识别 ==========
 def preprocess_captcha(image_bytes):
     img = Image.open(BytesIO(image_bytes))
     candidates = []
@@ -77,7 +77,6 @@ def preprocess_captcha(image_bytes):
 def ocr_captcha(image_bytes):
     ocr = ddddocr.DdddOcr(show_ad=False)
     candidates = preprocess_captcha(image_bytes)
-
     results = []
     for img_data in candidates:
         try:
@@ -87,17 +86,57 @@ def ocr_captcha(image_bytes):
                 results.append(clean[:5])
         except:
             continue
-
     if not results:
         return ""
-
     counter = Counter(results)
     best = counter.most_common(1)[0][0]
     print(f"    OCR 候选: {results} -> 选择: {best}")
     return best
 
 
-# ========== FOFA 自动登录 ==========
+def _ensure_fofa_session(session):
+    cookies_dict = {c.name: c.value for c in session.cookies}
+    if "fofa_token" in cookies_dict:
+        return
+
+    print("  补全 FOFA session...")
+    try:
+        resp = session.get("https://fofa.info/", timeout=15, allow_redirects=True)
+        print(f"  首页: {resp.status_code}, URL: {resp.url}")
+        cookies_dict = {c.name: c.value for c in session.cookies}
+        print(f"  Cookies: {list(cookies_dict.keys())}")
+
+        if "fofa_token" in cookies_dict:
+            print("  fofa_token 已获取")
+            return
+
+        for pattern in [
+            r'fofa_token["\s:=]+["\']?(eyJ[^"\';\s,]+)',
+            r'"token"\s*:\s*"(eyJ[^"]+)"',
+            r"fofa_token=(eyJ[^;]+)",
+        ]:
+            match = re.search(pattern, resp.text)
+            if match:
+                token = match.group(1)
+                session.cookies.set("fofa_token", token, domain=".fofa.info")
+                print("  从页面提取 fofa_token")
+                return
+
+        if "user" in cookies_dict:
+            user_data = urllib.parse.unquote(cookies_dict["user"])
+            try:
+                user_json = json.loads(user_data)
+                if "token" in user_json:
+                    session.cookies.set("fofa_token", user_json["token"], domain=".fofa.info")
+                    print("  从 user cookie 提取 token")
+                    return
+            except:
+                pass
+
+    except Exception as e:
+        print(f"  补全失败: {e}")
+
+
 def fofa_login():
     session = requests.Session()
     session.headers.update({
@@ -132,10 +171,12 @@ def fofa_login():
 
         if "fofa.info" in final_url and "ticket=" in final_url:
             print("  ✅ SSO 已登录，回调完成")
+            _ensure_fofa_session(session)
             return session
 
         if "fofa.info" in final_url and "i.nosec.org" not in final_url:
             print("  ✅ 已登录（跳转到 FOFA）")
+            _ensure_fofa_session(session)
             return session
 
         soup = BeautifulSoup(login_page.text, "html.parser")
@@ -148,6 +189,7 @@ def fofa_login():
             try:
                 test = session.get("https://fofa.info/", timeout=15)
                 if test.status_code == 200:
+                    _ensure_fofa_session(session)
                     print("  ✅ 已登录")
                     return session
             except:
@@ -216,24 +258,22 @@ def fofa_login():
         print(f"  状态: {resp.status_code}, URL: {resp.url}")
         print(f"  Cookies: {list(cookies_dict.keys())}")
 
+        logged_in = False
         if "fofa_token" in cookies_dict:
-            print("  ✅ 登录成功")
-            return session
+            logged_in = True
+        elif "tgt" in cookies_dict:
+            logged_in = True
+        elif "fofa.info" in resp.url and "ticket=" in resp.url:
+            logged_in = True
+        elif "fofa.info" in resp.url and "/login" not in resp.url.split("?")[0].replace("f_login", ""):
+            logged_in = True
+        elif "退出" in resp.text or "个人中心" in resp.text:
+            logged_in = True
 
-        if "tgt" in cookies_dict:
-            print("  ✅ 登录成功（SSO tgt）")
-            return session
-
-        if "fofa.info" in resp.url and "ticket=" in resp.url:
-            print("  ✅ 登录成功（SSO 回调）")
-            return session
-
-        if "fofa.info" in resp.url and "/login" not in resp.url.split("?")[0].replace("f_login", ""):
-            print("  ✅ 登录成功（跳转 FOFA）")
-            return session
-
-        if "退出" in resp.text or "个人中心" in resp.text:
-            print("  ✅ 登录成功")
+        if logged_in:
+            _ensure_fofa_session(session)
+            cookies_dict = {c.name: c.value for c in session.cookies}
+            print(f"  ✅ 登录成功, Cookies: {list(cookies_dict.keys())}")
             return session
 
         if "验证码" in resp.text:
@@ -249,90 +289,43 @@ def fofa_login():
     return None
 
 
-# ========== 获取 FOFA JWT ==========
-def get_fofa_jwt(session):
-    """登录成功后，从 fofa.info 获取 JWT token"""
-    print("获取 FOFA JWT...")
-
-    # 方法1: 从 cookie 中获取
-    for cookie in session.cookies:
-        if cookie.name == "fofa_token":
-            print(f"  从 cookie 获取 JWT")
-            return cookie.value
-
-    # 方法2: 访问用户信息页面提取
-    try:
-        resp = session.get("https://fofa.info/userInfo", timeout=15)
-        # 尝试从页面中提取 token
-        match = re.search(r'"token"\s*:\s*"(eyJ[^"]+)"', resp.text)
-        if match:
-            print(f"  从 userInfo 页面提取 JWT")
-            return match.group(1)
-    except:
-        pass
-
-    # 方法3: 尝试 API 登录接口
-    try:
-        resp = session.get("https://fofa.info/api/users/info", timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            token = data.get("token") or data.get("fofa_token")
-            if token:
-                print(f"  从 API 获取 JWT")
-                return token
-    except:
-        pass
-
-    # 方法4: 访问首页，从 JS 变量或 meta 中提取
-    try:
-        resp = session.get("https://fofa.info/", timeout=15)
-        # 找 window.__INITIAL_STATE__ 或类似的
-        for pattern in [
-            r'fofa_token["\s:=]+["\']?(eyJ[^"\';\s]+)',
-            r'authorization["\s:=]+["\']?(eyJ[^"\';\s]+)',
-            r'token["\s:=]+["\']?(eyJ[^"\';\s]+)',
-        ]:
-            match = re.search(pattern, resp.text)
-            if match:
-                print(f"  从首页提取 JWT")
-                return match.group(1)
-    except:
-        pass
-
-    print("  ⚠️ 无法获取 JWT")
-    return None
-
-
-# ========== FOFA 搜索 ==========
 def fofa_search():
     session = fofa_login()
     if session is None:
         return []
 
-    # 获取 JWT
-    jwt = get_fofa_jwt(session)
-
-    # 先打印调试信息
-    print(f"JWT: {'有' if jwt else '无'}")
-    all_cookies = {c.name: c.value[:30] + "..." if len(c.value) > 30 else c.value
-                   for c in session.cookies}
-    print(f"所有 Cookies: {all_cookies}")
-
-    # 尝试访问 result 页面看返回什么
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = f"https://fofa.info/result?qbase64={qbase64}"
+
+    all_cookies = {c.name: (c.value[:40] + "...") if len(c.value) > 40 else c.value
+                   for c in session.cookies}
+    print(f"当前 Cookies: {all_cookies}")
     print(f"请求 FOFA: {url}")
 
-    try:
-        resp = session.get(url, timeout=60)
-        resp.raise_for_status()
-        print(f"  页面长度: {len(resp.text)}")
-        print(f"  前500字符: {resp.text[:500]}")
-    except Exception as e:
-        print(f"请求失败: {e}")
+    for attempt in range(3):
+        try:
+            resp = session.get(url, timeout=60)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            print(f"请求失败: {e}")
+            if attempt == 2:
+                return []
+            time.sleep(5)
+    else:
         return []
 
-    # 尝试从页面解析 IP（SSR 情况）
+    print(f"页面长度: {len(resp.text)}, URL: {resp.url}")
+
+    if "login" in resp.url and "f_login" not in resp.url:
+        print("⚠️ 仍未登录")
+        return []
+
+    if "hsxa-ip" not in resp.text:
+        print("⚠️ 页面无 hsxa-ip 数据")
+        print(f"前500字符: {resp.text[:500]}")
+        return []
+
     soup = BeautifulSoup(resp.text, "html.parser")
     ips = []
     ip_divs = soup.find_all("div", class_="hsxa-ip")
@@ -346,59 +339,11 @@ def fofa_search():
                 ips.append(ip_text)
                 break
 
-    if ips:
-        ips = list(dict.fromkeys(ips))
-        print(f"从页面提取到 {len(ips)} 个IP")
-        return ips
-
-    # 页面是 SPA，需要调 API
-    print("页面无数据（SPA），尝试调用内部 API...")
-
-    if not jwt:
-        print("⚠️ 没有 JWT，无法调用 API")
-        return []
-
-    # 调用 api.fofa.info 搜索
-    api_headers = {
-        "User-Agent": UA,
-        "Accept": "application/json",
-        "authorization": jwt,
-        "Origin": "https://fofa.info",
-        "Referer": "https://fofa.info/",
-    }
-
-    ts = str(int(time.time() * 1000))
-    api_url = "https://api.fofa.info/v1/search/all"
-    params = {
-        "qbase64": qbase64,
-        "page": "1",
-        "size": "100",
-        "fields": "ip",
-        "ts": ts,
-        "lang": "zh-CN",
-    }
-
-    try:
-        resp = session.get(api_url, headers=api_headers, params=params, timeout=30)
-        print(f"  API 状态: {resp.status_code}")
-        print(f"  API 响应: {resp.text[:500]}")
-
-        if resp.status_code == 200:
-            data = resp.json()
-            results = data.get("results", [])
-            for row in results:
-                ip = row[0] if isinstance(row, list) else row
-                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', str(ip)):
-                    ips.append(ip)
-    except Exception as e:
-        print(f"  API 调用失败: {e}")
-
     ips = list(dict.fromkeys(ips))
     print(f"提取到 {len(ips)} 个去重IP")
     return ips
 
 
-# ========== CF 反代指纹探测 ==========
 def check_cf_proxy(ip):
     try:
         resp = requests.get(f"https://{ip}/cdn-cgi/trace", verify=False, timeout=5)
@@ -416,7 +361,6 @@ def check_cf_proxy(ip):
     return False
 
 
-# ========== AbuseIPDB 检测 ==========
 def abuseipdb_check(ip):
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": 90}
@@ -425,7 +369,6 @@ def abuseipdb_check(ip):
     return resp.json()["data"]["abuseConfidenceScore"]
 
 
-# ========== Cloudflare DNS ==========
 def get_dns_records():
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
@@ -454,7 +397,6 @@ def delete_dns_record(record_id, ip):
     print(f"已删除 DNS 记录: {ip}")
 
 
-# ========== ProxyIP 检测 ==========
 def check_proxy_ips():
     print(f"\n===== 第五步：检测 ProxyIP =====")
     print("等待 30 秒让 DNS 生效...")
@@ -484,7 +426,6 @@ def check_proxy_ips():
     return ip_status
 
 
-# ========== 清理失败 IP ==========
 def cleanup_failed_ips(ip_status):
     print(f"\n===== 第六步：清理失败 IP =====")
     failed_ips = [ip for ip, s in ip_status.items() if s == "invalid"]
@@ -500,7 +441,6 @@ def cleanup_failed_ips(ip_status):
                 print(f"❌ 删除失败 {r['content']}: {e}")
 
 
-# ========== 主流程 ==========
 def main():
     print("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
@@ -509,4 +449,43 @@ def main():
         return
 
     print("\n===== 第二步：探测 CF 反代特征 =====")
-    cf
+    cf_ips = []
+    for idx, ip in enumerate(ips, 1):
+        print(f"[{idx}/{len(ips)}] {ip} ...", end=" ")
+        if check_cf_proxy(ip):
+            print("✅")
+            cf_ips.append(ip)
+        else:
+            print("❌")
+    print(f"CF 节点: {len(cf_ips)} 个")
+    if not cf_ips:
+        return
+
+    print("\n===== 第三步：AbuseIPDB 检测 =====")
+    clean_ips = []
+    for ip in cf_ips:
+        try:
+            score = abuseipdb_check(ip)
+            print(f"  {ip} 评分: {score}")
+            if score < ABUSE_THRESHOLD:
+                clean_ips.append(ip)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"  {ip} 失败: {e}")
+    if not clean_ips:
+        return
+
+    print("\n===== 第四步：添加 DNS =====")
+    for ip in clean_ips:
+        try:
+            create_dns_record(ip)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"添加失败 {ip}: {e}")
+
+    cleanup_failed_ips(check_proxy_ips())
+    print("\n===== 全部完毕 =====")
+
+
+if __name__ == "__main__":
+    main()
