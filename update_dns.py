@@ -1,12 +1,14 @@
 import os
-import requests
-import base64
-import time
 import re
+import time
+import base64
+import requests
 import urllib3
+import ddddocr
+from io import BytesIO
+from PIL import Image, ImageFilter, ImageEnhance
 from bs4 import BeautifulSoup
 
-# ✅ 禁用忽略证书验证时的安全警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
@@ -14,56 +16,221 @@ CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CF_ZONE_ID = os.getenv("CLOUDFLARE_ZONE_ID")
 CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
-FOFA_COOKIE = os.getenv("FOFA_COOKIE")
+
+FOFA_EMAIL = os.getenv("FOFA_EMAIL")
+FOFA_PASSWORD = os.getenv("FOFA_PASSWORD")
 
 FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country=="US"'
 PROXY_CHECK_URL = "https://check.proxyip.cmliussss.net"
-
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
-
 ABUSE_THRESHOLD = 20
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://fofa.info/",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-GPC": "1"
-}
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+
+
+# ========== 验证码识别 ==========
+def preprocess_captcha(image_bytes):
+    """多种预处理方式，返回多个候选图片字节"""
+    img = Image.open(BytesIO(image_bytes))
+    candidates = []
+
+    # 原图
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    candidates.append(buf.getvalue())
+
+    # 方式1: 灰度 + 高对比度 + 二值化
+    gray = img.convert("L")
+    enhanced = ImageEnhance.Contrast(gray).enhance(2.0)
+    bw = enhanced.point(lambda x: 255 if x > 128 else 0, "1")
+    buf = BytesIO()
+    bw.save(buf, format="PNG")
+    candidates.append(buf.getvalue())
+
+    # 方式2: 灰度 + 锐化 + 低阈值二值化
+    sharp = gray.filter(ImageFilter.SHARPEN)
+    bw2 = sharp.point(lambda x: 255 if x > 100 else 0, "1")
+    buf = BytesIO()
+    bw2.save(buf, format="PNG")
+    candidates.append(buf.getvalue())
+
+    # 方式3: 放大2倍 + 灰度 + 二值化
+    big = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    big_gray = big.convert("L")
+    big_enhanced = ImageEnhance.Contrast(big_gray).enhance(2.5)
+    big_bw = big_enhanced.point(lambda x: 255 if x > 120 else 0, "1")
+    buf = BytesIO()
+    big_bw.save(buf, format="PNG")
+    candidates.append(buf.getvalue())
+
+    # 方式4: 中值滤波去噪 + 二值化
+    median = gray.filter(ImageFilter.MedianFilter(3))
+    med_bw = median.point(lambda x: 255 if x > 130 else 0, "1")
+    buf = BytesIO()
+    med_bw.save(buf, format="PNG")
+    candidates.append(buf.getvalue())
+
+    return candidates
+
+
+def ocr_captcha(image_bytes):
+    """多预处理 + ddddocr 识别，取最可能的结果"""
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    candidates = preprocess_captcha(image_bytes)
+
+    results = []
+    for img_data in candidates:
+        try:
+            text = ocr.classification(img_data)
+            # rucaptcha 是纯字母，5位
+            clean = re.sub(r'[^a-zA-Z]', '', text).lower()
+            if 4 <= len(clean) <= 6:
+                results.append(clean[:5])
+        except:
+            continue
+
+    if not results:
+        return ""
+
+    # 投票：取出现次数最多的结果
+    from collections import Counter
+    counter = Counter(results)
+    best = counter.most_common(1)[0][0]
+    print(f"    OCR 候选: {results} -> 选择: {best}")
+    return best
+
+
+# ========== FOFA 自动登录 ==========
+def fofa_login():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "DNT": "1",
+    })
+
+    for attempt in range(10):
+        print(f"登录尝试 {attempt + 1}/10 ...")
+
+        # 1. 访问登录页
+        try:
+            login_page = session.get("https://fofa.info/toLogin", timeout=30)
+            login_page.raise_for_status()
+        except Exception as e:
+            print(f"  访问登录页失败: {e}")
+            time.sleep(3)
+            continue
+
+        soup = BeautifulSoup(login_page.text, "html.parser")
+
+        # CSRF token
+        csrf_token = ""
+        csrf_input = soup.find("input", {"name": "authenticity_token"})
+        if csrf_input:
+            csrf_token = csrf_input.get("value", "")
+        if not csrf_token:
+            meta = soup.find("meta", {"name": "csrf-token"})
+            if meta:
+                csrf_token = meta.get("content", "")
+
+        # 2. 下载验证码
+        try:
+            captcha_resp = session.get(
+                f"https://fofa.info/rucaptcha/?t={int(time.time() * 1000)}",
+                timeout=15
+            )
+            captcha_resp.raise_for_status()
+        except Exception as e:
+            print(f"  下载验证码失败: {e}")
+            time.sleep(2)
+            continue
+
+        # 3. OCR 识别
+        captcha_text = ocr_captcha(captcha_resp.content)
+        print(f"  验证码: {captcha_text}")
+
+        if len(captcha_text) < 4:
+            print(f"  识别失败，换一张...")
+            time.sleep(1)
+            continue
+
+        # 4. 提交登录
+        login_data = {
+            "username": FOFA_EMAIL,
+            "password": FOFA_PASSWORD,
+            "_rucaptcha": captcha_text,
+            "rememberMe": "1",
+            "fofa_service": "1",
+        }
+        if csrf_token:
+            login_data["authenticity_token"] = csrf_token
+
+        form = soup.find("form")
+        action_url = "https://fofa.info/toLogin"
+        if form and form.get("action"):
+            action = form.get("action")
+            if action.startswith("/"):
+                action_url = f"https://fofa.info{action}"
+            elif action.startswith("http"):
+                action_url = action
+
+        try:
+            resp = session.post(action_url, data=login_data, timeout=30, allow_redirects=True)
+        except Exception as e:
+            print(f"  提交登录失败: {e}")
+            time.sleep(3)
+            continue
+
+        # 5. 判断结果
+        cookies_dict = {c.name: c.value for c in session.cookies}
+        print(f"  状态: {resp.status_code}, Cookies: {list(cookies_dict.keys())}")
+
+        if "fofa_token" in cookies_dict:
+            print("  ✅ 登录成功")
+            return session
+
+        if "退出" in resp.text or "个人中心" in resp.text:
+            print("  ✅ 登录成功")
+            return session
+
+        if "验证码" in resp.text:
+            print("  ❌ 验证码错误，重试...")
+        else:
+            print("  ❌ 登录失败，重试...")
+
+        time.sleep(1)
+
+    print("10 次登录均失败")
+    return None
+
 
 # ========== FOFA 搜索 ==========
 def fofa_search():
+    session = fofa_login()
+    if session is None:
+        return []
+
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = f"https://fofa.info/result?qbase64={qbase64}"
-    headers = HEADERS.copy()
-    headers["Cookie"] = FOFA_COOKIE
-
     print(f"请求 FOFA: {url}")
-    resp = None
+
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=headers, timeout=60)
+            resp = session.get(url, timeout=60)
             resp.raise_for_status()
             break
-        except requests.exceptions.ReadTimeout:
-            print(f"请求超时，第 {attempt + 1}/3 次重试...")
-            if attempt == 2:
-                print("FOFA 请求 3 次均超时，退出")
-                return []
-            time.sleep(5)
         except Exception as e:
             print(f"请求失败: {e}")
             if attempt == 2:
                 return []
             time.sleep(5)
+    else:
+        return []
 
-    if resp is None:
+    if "toLogin" in resp.url:
+        print("⚠️ 仍未登录")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -83,20 +250,16 @@ def fofa_search():
     print(f"提取到 {len(ips)} 个去重IP")
     return ips
 
-# ========== CF 反代指纹深度探测 (新增模块) ==========
+
+# ========== 以下不变 ==========
+
 def check_cf_proxy(ip):
-    """
-    通过底层物理探针验证是否为真实的 Cloudflare 反代节点
-    """
-    # 探针 1: 访问 CF 专属路由探测点
     try:
         resp = requests.get(f"https://{ip}/cdn-cgi/trace", verify=False, timeout=5)
         if "cloudflare" in resp.text.lower():
             return True
     except:
         pass
-
-    # 探针 2: 访问 HTTP/HTTPS 端口提取 Server 响应头
     for scheme in ["http", "https"]:
         try:
             resp = requests.head(f"{scheme}://{ip}", verify=False, timeout=5)
@@ -104,10 +267,9 @@ def check_cf_proxy(ip):
                 return True
         except:
             continue
-
     return False
 
-# ========== AbuseIPDB 检测 ==========
+
 def abuseipdb_check(ip):
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": 90}
@@ -115,69 +277,50 @@ def abuseipdb_check(ip):
     resp.raise_for_status()
     return resp.json()["data"]["abuseConfidenceScore"]
 
-# ========== Cloudflare DNS ==========
+
 def get_dns_records():
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    params = {"type": "A", "name": fqdn}
-    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers, params=params, timeout=15)
+    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers, params={"type": "A", "name": fqdn}, timeout=15)
     resp.raise_for_status()
     return resp.json().get("result", [])
 
+
 def create_dns_record(ip):
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    existing = get_dns_records()
-    for r in existing:
+    for r in get_dns_records():
         if r["content"] == ip:
             print(f"IP {ip} 已存在，跳过")
             return
-
     data = {"type": "A", "name": fqdn, "content": ip, "ttl": 1, "proxied": False}
     resp = requests.post(CF_DNS_RECORDS_URL, headers=headers, json=data, timeout=15)
     resp.raise_for_status()
     print(f"已添加 DNS: {fqdn} -> {ip}")
 
+
 def delete_dns_record(record_id, ip):
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    url = f"{CF_DNS_RECORDS_URL}/{record_id}"
-    resp = requests.delete(url, headers=headers, timeout=15)
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    resp = requests.delete(f"{CF_DNS_RECORDS_URL}/{record_id}", headers=headers, timeout=15)
     resp.raise_for_status()
     print(f"已删除 DNS 记录: {ip}")
 
-# ========== ProxyIP 检测 ==========
+
 def check_proxy_ips():
     print(f"\n===== 第五步：检测 ProxyIP =====")
     print("等待 30 秒让 DNS 生效...")
     time.sleep(30)
-
     records = get_dns_records()
     if not records:
         print("没有 DNS 记录需要检测")
         return {}
-
     all_ips = [r["content"] for r in records]
-    print(f"当前 DNS 中的 IP: {all_ips}")
-
     ip_status = {}
     for ip in all_ips:
         try:
-            check_url = f"{PROXY_CHECK_URL}/check?proxyip={ip}:443"
-            print(f"检测 IP: {ip}")
-            resp = requests.get(check_url, timeout=30)
+            resp = requests.get(f"{PROXY_CHECK_URL}/check?proxyip={ip}:443", timeout=30)
             resp.raise_for_status()
             data = resp.json()
-            print(f"  返回: {data}")
-
             if data.get("success", False):
                 ip_status[ip] = "valid"
                 print(f"  ✅ {ip} 有效")
@@ -186,86 +329,71 @@ def check_proxy_ips():
                 print(f"  ❌ {ip} 无效")
         except Exception as e:
             ip_status[ip] = "invalid"
-            print(f"  ❌ {ip} 检测出错，标记为无效: {e}")
+            print(f"  ❌ {ip} 出错: {e}")
         time.sleep(1)
-
     return ip_status
 
-# ========== 清理失败 IP ==========
+
 def cleanup_failed_ips(ip_status):
     print(f"\n===== 第六步：清理失败 IP =====")
-    failed_ips = [ip for ip, status in ip_status.items() if status == "invalid"]
-
+    failed_ips = [ip for ip, s in ip_status.items() if s == "invalid"]
     if not failed_ips:
-        print("所有 IP 检测正常，无需清理")
+        print("所有 IP 正常")
         return
-
-    print(f"需要删除的失败 IP: {failed_ips}")
     records = get_dns_records()
-    for record in records:
-        if record["content"] in failed_ips:
+    for r in records:
+        if r["content"] in failed_ips:
             try:
-                delete_dns_record(record["id"], record["content"])
-                print(f"✅ 已删除 {record['content']}")
+                delete_dns_record(r["id"], r["content"])
             except Exception as e:
-                print(f"❌ 删除失败 {record['content']}: {e}")
+                print(f"❌ 删除失败 {r['content']}: {e}")
 
-# ========== 主流程 ==========
+
 def main():
     print("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
     print(f"找到 {len(ips)} 个IP: {ips}")
-
     if not ips:
-        print("未找到任何IP")
         return
 
-    print("\n===== 第二步：核心鉴伪 - 探测 CF 反代特征 =====")
+    print("\n===== 第二步：探测 CF 反代特征 =====")
     cf_ips = []
     for idx, ip in enumerate(ips, 1):
-        print(f"[{idx}/{len(ips)}] 探测 IP {ip} ...", end=" ")
+        print(f"[{idx}/{len(ips)}] {ip} ...", end=" ")
         if check_cf_proxy(ip):
-            print("✅ 确认为 CF 反代节点")
+            print("✅")
             cf_ips.append(ip)
         else:
-            print("⚡ 剔除: 未发现底层特征")
-            
-    print(f"\n物理验证通过的 CF 节点（共 {len(cf_ips)} 个）: {cf_ips}")
-
+            print("❌")
+    print(f"CF 节点: {len(cf_ips)} 个")
     if not cf_ips:
-        print("没有可用的 CF 节点，跳过后续步骤")
         return
 
-    print("\n===== 第三步：AbuseIPDB 纯净度检测 =====")
+    print("\n===== 第三步：AbuseIPDB 检测 =====")
     clean_ips = []
-    for idx, ip in enumerate(cf_ips, 1):
+    for ip in cf_ips:
         try:
             score = abuseipdb_check(ip)
-            print(f"[{idx}/{len(cf_ips)}] IP {ip} 评分: {score}")
+            print(f"  {ip} 评分: {score}")
             if score < ABUSE_THRESHOLD:
                 clean_ips.append(ip)
             time.sleep(0.5)
         except Exception as e:
-            print(f"检查 IP {ip} 失败: {e}")
-
-    print(f"\n高纯净度节点（共 {len(clean_ips)} 个）: {clean_ips}")
-
+            print(f"  {ip} 失败: {e}")
     if not clean_ips:
-        print("没有纯净 IP，跳过")
         return
 
-    print("\n===== 第四步：添加 Cloudflare DNS 记录 =====")
+    print("\n===== 第四步：添加 DNS =====")
     for ip in clean_ips:
         try:
             create_dns_record(ip)
             time.sleep(0.5)
         except Exception as e:
-            print(f"添加 DNS 失败 {ip}: {e}")
+            print(f"添加失败 {ip}: {e}")
 
-    ip_status = check_proxy_ips()
-    cleanup_failed_ips(ip_status)
+    cleanup_failed_ips(check_proxy_ips())
+    print("\n===== 全部完毕 =====")
 
-    print("\n===== 📅 全部任务高效执行完毕 =====")
 
 if __name__ == "__main__":
     main()
