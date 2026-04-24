@@ -109,27 +109,57 @@ def fofa_login():
     for attempt in range(10):
         print(f"登录尝试 {attempt + 1}/10 ...")
 
+        # 检查是否已经登录
+        cookies_dict = {c.name: c.value for c in session.cookies}
+        if "tgt" in cookies_dict or "fofa_token" in cookies_dict:
+            try:
+                test = session.get("https://fofa.info/", timeout=15)
+                if test.status_code == 200:
+                    print("  ✅ 已登录（session 有效）")
+                    return session
+            except:
+                pass
+
         # 1. 访问登录页
         try:
             login_page = session.get(LOGIN_PAGE, timeout=30, allow_redirects=True)
             login_page.raise_for_status()
-            print(f"  登录页: {login_page.url} ({login_page.status_code})")
+            final_url = login_page.url
+            print(f"  登录页: {final_url} ({login_page.status_code})")
         except Exception as e:
             print(f"  访问登录页失败: {e}")
             time.sleep(3)
             continue
 
+        # SSO 已登录：访问登录页直接跳回 fofa.info
+        if "fofa.info" in final_url and "ticket=" in final_url:
+            print("  ✅ SSO 已登录，回调完成")
+            return session
+
+        if "fofa.info" in final_url and "i.nosec.org" not in final_url:
+            print("  ✅ 已登录（跳转到 FOFA）")
+            return session
+
         soup = BeautifulSoup(login_page.text, "html.parser")
 
-        # 提取所有 hidden 字段
+        # 找表单
         form = soup.find("form", {"id": "login-form"})
         if not form:
             form = soup.find("form")
         if not form:
-            print("  ⚠️ 未找到登录表单")
+            print("  没有登录表单，尝试直接访问 FOFA...")
+            try:
+                test = session.get("https://fofa.info/", timeout=15)
+                if test.status_code == 200:
+                    print("  ✅ 已登录")
+                    return session
+            except:
+                pass
+            print("  ⚠️ 未找到表单且无法访问")
             time.sleep(3)
             continue
 
+        # 提取 hidden 字段
         hidden_fields = {}
         for inp in form.find_all("input", {"type": "hidden"}):
             name = inp.get("name")
@@ -137,7 +167,7 @@ def fofa_login():
             if name:
                 hidden_fields[name] = value
 
-        print(f"  Hidden 字段: {list(hidden_fields.keys())}")
+        print(f"  Hidden: {list(hidden_fields.keys())}")
 
         # 表单 action
         parsed = urlparse(login_page.url)
@@ -148,8 +178,6 @@ def fofa_login():
             action_url = action
         else:
             action_url = f"{parsed.scheme}://{parsed.netloc}/login"
-
-        print(f"  表单: {action_url}")
 
         # 2. 下载验证码
         captcha_base = f"{parsed.scheme}://{parsed.netloc}"
@@ -173,9 +201,9 @@ def fofa_login():
             time.sleep(1)
             continue
 
-        # 4. 构建完整表单数据（包含所有 hidden 字段）
+        # 4. 提交
         login_data = {}
-        login_data.update(hidden_fields)  # utf8, authenticity_token, lt, service, locale
+        login_data.update(hidden_fields)
         login_data.update({
             "username": FOFA_EMAIL,
             "password": FOFA_PASSWORD,
@@ -210,20 +238,26 @@ def fofa_login():
             print("  ✅ 登录成功")
             return session
 
+        if "tgt" in cookies_dict:
+            print("  ✅ 登录成功（SSO tgt）")
+            return session
+
+        if "fofa.info" in resp.url and "ticket=" in resp.url:
+            print("  ✅ 登录成功（SSO 回调）")
+            return session
+
+        if "fofa.info" in resp.url and "/login" not in resp.url.split("?")[0].replace("f_login", ""):
+            print("  ✅ 登录成功（跳转 FOFA）")
+            return session
+
         if "退出" in resp.text or "个人中心" in resp.text:
             print("  ✅ 登录成功")
             return session
 
-        if "fofa.info" in resp.url and "login" not in resp.url and "sign_in" not in resp.url:
-            print("  ✅ 登录成功（SSO 回调完成）")
-            return session
-
-        if "验证码" in resp.text and ("错误" in resp.text or "不正确" in resp.text or "无效" in resp.text):
+        if "验证码" in resp.text:
             print("  ❌ 验证码错误")
         elif resp.status_code == 403:
-            print("  ❌ 403 被拒绝")
-            # 打印响应帮助调试
-            print(f"  响应: {resp.text[:300]}")
+            print("  ❌ 403")
         else:
             print("  ❌ 登录失败")
 
@@ -256,7 +290,7 @@ def fofa_search():
     else:
         return []
 
-    if "login" in resp.url:
+    if "login" in resp.url and "f_login" not in resp.url:
         print("⚠️ 仍未登录")
         return []
 
