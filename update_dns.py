@@ -5,15 +5,23 @@ import re
 import time
 import json
 import base64
+import logging
 import requests
 import urllib3
+import urllib.parse
 import ddddocr
+import undetected_chromedriver as uc
 from io import BytesIO
 from collections import Counter
 from PIL import Image, ImageFilter, ImageEnhance
-from playwright.sync_api import sync_playwright
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+log = logging.getLogger(__name__)
 
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
@@ -30,7 +38,6 @@ ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 ABUSE_THRESHOLD = 20
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
 LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f_login"
 
 
@@ -89,149 +96,170 @@ def ocr_captcha(image_bytes):
         return ""
     counter = Counter(results)
     best = counter.most_common(1)[0][0]
-    print(f"    OCR 候选: {results} -> 选择: {best}")
+    log.info(f"  OCR 候选: {results} -> {best}")
     return best
 
 
-# ========== Playwright 登录 + 搜索 ==========
-def fofa_search():
-    qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
-    search_url = f"https://fofa.info/result?qbase64={qbase64}"
+# ========== Chrome 登录 FOFA ==========
+def create_driver():
+    options = uc.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    driver = uc.Chrome(options=options, headless=False)
+    return driver
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=UA)
-        page = context.new_page()
 
-        # 登录
-        fofa_key = None
-        fofa_email_found = None
+def fofa_login_and_get_credentials():
+    """用 Chrome 登录 FOFA，返回 (fofa_key, fofa_email, fofa_token)"""
+    driver = create_driver()
+    fofa_key = None
+    fofa_email_found = None
+    fofa_token = None
 
+    try:
         for attempt in range(10):
-            print(f"登录尝试 {attempt + 1}/10 ...")
+            log.info(f"登录尝试 {attempt + 1}/10 ...")
 
-            page.goto(LOGIN_PAGE, timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            driver.get(LOGIN_PAGE)
+            time.sleep(3)
 
-            # 检查是否已经跳转到 fofa（已登录）
-            if "fofa.info" in page.url and "login" not in page.url.lower():
-                print("  ✅ 已登录")
+            # 已经跳转到 fofa
+            if "fofa.info" in driver.current_url and "login" not in driver.current_url.lower():
+                log.info("  ✅ 已登录")
                 break
 
-            # 填写表单
+            # 填写邮箱密码
             try:
-                page.fill('input[name="username"]', FOFA_EMAIL, timeout=5000)
-                page.fill('input[name="password"]', FOFA_PASSWORD, timeout=5000)
-            except:
-                print("  找不到登录表单")
-                time.sleep(2)
+                username_input = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.NAME, "username"))
+                )
+                username_input.clear()
+                username_input.send_keys(FOFA_EMAIL)
+
+                password_input = driver.find_element(By.NAME, "password")
+                password_input.clear()
+                password_input.send_keys(FOFA_PASSWORD)
+            except TimeoutException:
+                log.info("  找不到登录表单")
                 continue
 
-            # 下载验证码
+            # 截图验证码并识别
             try:
-                captcha_img = page.query_selector('#captcha_image')
-                if captcha_img:
-                    captcha_bytes = captcha_img.screenshot()
-                    captcha_text = ocr_captcha(captcha_bytes)
-                    print(f"  验证码: {captcha_text}")
+                captcha_img = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.ID, "captcha_image"))
+                )
+                captcha_bytes = captcha_img.screenshot_as_png
+                captcha_text = ocr_captcha(captcha_bytes)
+                log.info(f"  验证码: {captcha_text}")
 
-                    if len(captcha_text) < 4:
-                        print("  识别失败，刷新验证码...")
-                        captcha_img.click()
-                        time.sleep(1)
-                        continue
-
-                    page.fill('input[name="_rucaptcha"]', captcha_text, timeout=5000)
-                else:
-                    print("  找不到验证码图片")
+                if len(captcha_text) < 4:
+                    log.info("  识别失败，刷新验证码...")
+                    captcha_img.click()
+                    time.sleep(1)
                     continue
+
+                captcha_input = driver.find_element(By.NAME, "_rucaptcha")
+                captcha_input.clear()
+                captcha_input.send_keys(captcha_text)
             except Exception as e:
-                print(f"  验证码处理失败: {e}")
+                log.info(f"  验证码处理失败: {e}")
                 continue
 
             # 勾选协议
             try:
-                fofa_service = page.query_selector('#fofa_service')
-                if fofa_service and not fofa_service.is_checked():
-                    fofa_service.check()
+                checkbox = driver.find_element(By.ID, "fofa_service")
+                if not checkbox.is_selected():
+                    driver.execute_script("arguments[0].click();", checkbox)
             except:
                 pass
 
             # 提交
             try:
-                page.click('button[type="submit"]', timeout=5000)
-                page.wait_for_load_state("networkidle", timeout=15000)
+                submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                submit_btn.click()
+                time.sleep(5)
             except:
                 pass
 
-            print(f"  提交后 URL: {page.url}")
+            log.info(f"  提交后 URL: {driver.current_url}")
 
-            # 检查是否登录成功
-            if "fofa.info" in page.url and "login" not in page.url.replace("f_login", "").lower():
-                print("  ✅ 登录成功")
+            if "fofa.info" in driver.current_url and "login" not in driver.current_url.replace("f_login", "").lower():
+                log.info("  ✅ 登录成功")
                 break
 
-            if "i.nosec.org" in page.url:
-                # 检查是否验证码错误
-                content = page.content()
-                if "验证码" in content:
-                    print("  ❌ 验证码错误")
-                else:
-                    print("  ❌ 登录失败")
+            if "i.nosec.org" in driver.current_url:
+                log.info("  ❌ 验证码错误或登录失败")
                 time.sleep(1)
                 continue
 
-        # 从 cookie 提取 API key
-        cookies = context.cookies()
-        print(f"  所有 cookies: {[c['name'] for c in cookies]}")
+        # 确保在 fofa.info 上
+        if "fofa.info" not in driver.current_url:
+            driver.get("https://fofa.info/")
+            time.sleep(3)
+
+        # 从 cookie 提取凭证
+        cookies = driver.get_cookies()
+        log.info(f"  Cookies: {[c['name'] for c in cookies]}")
 
         for c in cookies:
             if c["name"] == "user":
                 try:
-                    import urllib.parse
                     user_data = urllib.parse.unquote(c["value"])
                     user_json = json.loads(user_data)
                     fofa_key = user_json.get("key")
                     fofa_email_found = user_json.get("email", FOFA_EMAIL)
-                    print(f"  API key: {fofa_key[:8]}..." if fofa_key else "  无 key")
+                    if fofa_key:
+                        log.info(f"  API key: {fofa_key[:8]}...")
                 except:
                     pass
-
-        fofa_token = None
-        for c in cookies:
             if c["name"] == "fofa_token":
                 fofa_token = c["value"]
-                print(f"  fofa_token: {fofa_token[:30]}...")
+                log.info(f"  fofa_token: {fofa_token[:30]}...")
 
-        # 如果没拿到 key，尝试访问 userInfo 页面
+        # 如果没拿到，访问 userInfo 触发
         if not fofa_key and not fofa_token:
-            print("  尝试访问 userInfo...")
-            try:
-                page.goto("https://fofa.info/userInfo", timeout=15000)
-                page.wait_for_load_state("networkidle", timeout=10000)
-                time.sleep(2)
+            log.info("  访问 userInfo 补全...")
+            driver.get("https://fofa.info/userInfo")
+            time.sleep(5)
 
-                cookies = context.cookies()
-                for c in cookies:
-                    if c["name"] == "user":
-                        try:
-                            import urllib.parse
-                            user_data = urllib.parse.unquote(c["value"])
-                            user_json = json.loads(user_data)
-                            fofa_key = user_json.get("key")
-                            fofa_email_found = user_json.get("email", FOFA_EMAIL)
-                        except:
-                            pass
-                    if c["name"] == "fofa_token":
-                        fofa_token = c["value"]
-            except:
-                pass
+            cookies = driver.get_cookies()
+            for c in cookies:
+                if c["name"] == "user":
+                    try:
+                        user_data = urllib.parse.unquote(c["value"])
+                        user_json = json.loads(user_data)
+                        fofa_key = user_json.get("key")
+                        fofa_email_found = user_json.get("email", FOFA_EMAIL)
+                    except:
+                        pass
+                if c["name"] == "fofa_token":
+                    fofa_token = c["value"]
 
-        browser.close()
+    except Exception as e:
+        log.error(f"登录异常: {e}")
+        try:
+            driver.save_screenshot("login_error.png")
+        except:
+            pass
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
 
-    # 用 API key 查询
+    return fofa_key, fofa_email_found, fofa_token
+
+
+# ========== FOFA 搜索 ==========
+def fofa_search():
+    fofa_key, fofa_email_found, fofa_token = fofa_login_and_get_credentials()
+    qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
+
+    # 方式1: API key
     if fofa_key:
-        print(f"使用 API key 查询")
+        log.info(f"使用 API key 查询")
         params = {
             "email": fofa_email_found or FOFA_EMAIL,
             "key": fofa_key,
@@ -242,11 +270,11 @@ def fofa_search():
         }
         try:
             resp = requests.get("https://fofa.info/api/v1/search/all", params=params, timeout=60)
-            print(f"  API 状态: {resp.status_code}")
+            log.info(f"  API 状态: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("error"):
-                    print(f"  API 错误: {data.get('errmsg', data)}")
+                    log.info(f"  API 错误: {data.get('errmsg', data)}")
                 else:
                     results = data.get("results", [])
                     ips = []
@@ -255,18 +283,17 @@ def fofa_search():
                         if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', str(ip)):
                             ips.append(str(ip))
                     ips = list(dict.fromkeys(ips))
-                    print(f"提取到 {len(ips)} 个去重IP")
+                    log.info(f"提取到 {len(ips)} 个去重IP")
                     return ips
             else:
-                print(f"  响应: {resp.text[:300]}")
+                log.info(f"  响应: {resp.text[:300]}")
         except Exception as e:
-            print(f"  API 失败: {e}")
+            log.info(f"  API 失败: {e}")
 
-    # 用 JWT 查询
+    # 方式2: JWT
     if fofa_token:
-        print(f"使用 JWT 查询")
+        log.info(f"使用 JWT 查询")
         api_headers = {
-            "User-Agent": UA,
             "Accept": "application/json",
             "authorization": fofa_token,
             "Origin": "https://fofa.info",
@@ -283,7 +310,7 @@ def fofa_search():
         try:
             resp = requests.get("https://api.fofa.info/v1/search/all",
                                 headers=api_headers, params=params, timeout=30)
-            print(f"  API 状态: {resp.status_code}")
+            log.info(f"  API 状态: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
                 results = data.get("results", [])
@@ -293,14 +320,14 @@ def fofa_search():
                     if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', str(ip)):
                         ips.append(str(ip))
                 ips = list(dict.fromkeys(ips))
-                print(f"提取到 {len(ips)} 个去重IP")
+                log.info(f"提取到 {len(ips)} 个去重IP")
                 return ips
             else:
-                print(f"  响应: {resp.text[:300]}")
+                log.info(f"  响应: {resp.text[:300]}")
         except Exception as e:
-            print(f"  API 失败: {e}")
+            log.info(f"  API 失败: {e}")
 
-    print("无法获取数据")
+    log.info("无法获取数据")
     return []
 
 
@@ -345,32 +372,32 @@ def create_dns_record(ip):
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
     for r in get_dns_records():
         if r["content"] == ip:
-            print(f"IP {ip} 已存在，跳过")
+            log.info(f"IP {ip} 已存在，跳过")
             return
     data = {"type": "A", "name": fqdn, "content": ip, "ttl": 1, "proxied": False}
     resp = requests.post(CF_DNS_RECORDS_URL, headers=headers, json=data, timeout=15)
     resp.raise_for_status()
-    print(f"已添加 DNS: {fqdn} -> {ip}")
+    log.info(f"已添加 DNS: {fqdn} -> {ip}")
 
 
 def delete_dns_record(record_id, ip):
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     resp = requests.delete(f"{CF_DNS_RECORDS_URL}/{record_id}", headers=headers, timeout=15)
     resp.raise_for_status()
-    print(f"已删除 DNS 记录: {ip}")
+    log.info(f"已删除 DNS 记录: {ip}")
 
 
 # ========== ProxyIP 检测 ==========
 def check_proxy_ips():
-    print(f"\n===== 第五步：检测 ProxyIP =====")
-    print("等待 30 秒让 DNS 生效...")
+    log.info("===== 第五步：检测 ProxyIP =====")
+    log.info("等待 30 秒让 DNS 生效...")
     time.sleep(30)
     records = get_dns_records()
     if not records:
-        print("没有 DNS 记录需要检测")
+        log.info("没有 DNS 记录需要检测")
         return {}
     all_ips = [r["content"] for r in records]
-    print(f"当前 DNS 中的 IP: {all_ips}")
+    log.info(f"当前 DNS 中的 IP: {all_ips}")
     ip_status = {}
     for ip in all_ips:
         try:
@@ -379,23 +406,23 @@ def check_proxy_ips():
             data = resp.json()
             if data.get("success", False):
                 ip_status[ip] = "valid"
-                print(f"  ✅ {ip} 有效")
+                log.info(f"  ✅ {ip} 有效")
             else:
                 ip_status[ip] = "invalid"
-                print(f"  ❌ {ip} 无效")
+                log.info(f"  ❌ {ip} 无效")
         except Exception as e:
             ip_status[ip] = "invalid"
-            print(f"  ❌ {ip} 出错: {e}")
+            log.info(f"  ❌ {ip} 出错: {e}")
         time.sleep(1)
     return ip_status
 
 
 # ========== 清理 ==========
 def cleanup_failed_ips(ip_status):
-    print(f"\n===== 第六步：清理失败 IP =====")
+    log.info("===== 第六步：清理失败 IP =====")
     failed_ips = [ip for ip, s in ip_status.items() if s == "invalid"]
     if not failed_ips:
-        print("所有 IP 正常")
+        log.info("所有 IP 正常")
         return
     records = get_dns_records()
     for r in records:
@@ -403,54 +430,54 @@ def cleanup_failed_ips(ip_status):
             try:
                 delete_dns_record(r["id"], r["content"])
             except Exception as e:
-                print(f"❌ 删除失败 {r['content']}: {e}")
+                log.info(f"❌ 删除失败 {r['content']}: {e}")
 
 
 # ========== 主流程 ==========
 def main():
-    print("===== 第一步：从 FOFA 搜索 IP =====")
+    log.info("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
-    print(f"找到 {len(ips)} 个IP: {ips}")
+    log.info(f"找到 {len(ips)} 个IP: {ips}")
     if not ips:
         return
 
-    print("\n===== 第二步：探测 CF 反代特征 =====")
+    log.info("===== 第二步：探测 CF 反代特征 =====")
     cf_ips = []
     for idx, ip in enumerate(ips, 1):
-        print(f"[{idx}/{len(ips)}] {ip} ...", end=" ")
+        log.info(f"[{idx}/{len(ips)}] {ip} ... ")
         if check_cf_proxy(ip):
-            print("✅")
+            log.info(f"  ✅ {ip}")
             cf_ips.append(ip)
         else:
-            print("❌")
-    print(f"CF 节点: {len(cf_ips)} 个")
+            log.info(f"  ❌ {ip}")
+    log.info(f"CF 节点: {len(cf_ips)} 个")
     if not cf_ips:
         return
 
-    print("\n===== 第三步：AbuseIPDB 检测 =====")
+    log.info("===== 第三步：AbuseIPDB 检测 =====")
     clean_ips = []
     for ip in cf_ips:
         try:
             score = abuseipdb_check(ip)
-            print(f"  {ip} 评分: {score}")
+            log.info(f"  {ip} 评分: {score}")
             if score < ABUSE_THRESHOLD:
                 clean_ips.append(ip)
             time.sleep(0.5)
         except Exception as e:
-            print(f"  {ip} 失败: {e}")
+            log.info(f"  {ip} 失败: {e}")
     if not clean_ips:
         return
 
-    print("\n===== 第四步：添加 DNS =====")
+    log.info("===== 第四步：添加 DNS =====")
     for ip in clean_ips:
         try:
             create_dns_record(ip)
             time.sleep(0.5)
         except Exception as e:
-            print(f"添加失败 {ip}: {e}")
+            log.info(f"添加失败 {ip}: {e}")
 
     cleanup_failed_ips(check_proxy_ips())
-    print("\n===== 全部完毕 =====")
+    log.info("===== 全部完毕 =====")
 
 
 if __name__ == "__main__":
