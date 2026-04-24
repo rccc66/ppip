@@ -39,12 +39,10 @@ def preprocess_captcha(image_bytes):
     img = Image.open(BytesIO(image_bytes))
     candidates = []
 
-    # 原图
     buf = BytesIO()
     img.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 灰度 + 高对比度 + 二值化
     gray = img.convert("L")
     enhanced = ImageEnhance.Contrast(gray).enhance(2.0)
     bw = enhanced.point(lambda x: 255 if x > 128 else 0, "1")
@@ -52,14 +50,12 @@ def preprocess_captcha(image_bytes):
     bw.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 灰度 + 锐化 + 低阈值二值化
     sharp = gray.filter(ImageFilter.SHARPEN)
     bw2 = sharp.point(lambda x: 255 if x > 100 else 0, "1")
     buf = BytesIO()
     bw2.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 放大2倍 + 灰度 + 二值化
     big = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
     big_gray = big.convert("L")
     big_enhanced = ImageEnhance.Contrast(big_gray).enhance(2.5)
@@ -68,7 +64,6 @@ def preprocess_captcha(image_bytes):
     big_bw.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 中值滤波去噪 + 二值化
     median = gray.filter(ImageFilter.MedianFilter(3))
     med_bw = median.point(lambda x: 255 if x > 130 else 0, "1")
     buf = BytesIO()
@@ -126,31 +121,37 @@ def fofa_login():
 
         soup = BeautifulSoup(login_page.text, "html.parser")
 
-        # CSRF token
-        csrf_token = ""
-        csrf_input = soup.find("input", {"name": "authenticity_token"})
-        if csrf_input:
-            csrf_token = csrf_input.get("value", "")
-        if not csrf_token:
-            meta = soup.find("meta", {"name": "csrf-token"})
-            if meta:
-                csrf_token = meta.get("content", "")
+        # 提取所有 hidden 字段
+        form = soup.find("form", {"id": "login-form"})
+        if not form:
+            form = soup.find("form")
+        if not form:
+            print("  ⚠️ 未找到登录表单")
+            time.sleep(3)
+            continue
+
+        hidden_fields = {}
+        for inp in form.find_all("input", {"type": "hidden"}):
+            name = inp.get("name")
+            value = inp.get("value", "")
+            if name:
+                hidden_fields[name] = value
+
+        print(f"  Hidden 字段: {list(hidden_fields.keys())}")
 
         # 表单 action
-        form = soup.find("form")
-        action_url = LOGIN_PAGE
-        if form and form.get("action"):
-            action = form.get("action")
-            if action.startswith("/"):
-                parsed = urlparse(login_page.url)
-                action_url = f"{parsed.scheme}://{parsed.netloc}{action}"
-            elif action.startswith("http"):
-                action_url = action
+        parsed = urlparse(login_page.url)
+        action = form.get("action", "/login")
+        if action.startswith("/"):
+            action_url = f"{parsed.scheme}://{parsed.netloc}{action}"
+        elif action.startswith("http"):
+            action_url = action
+        else:
+            action_url = f"{parsed.scheme}://{parsed.netloc}/login"
 
         print(f"  表单: {action_url}")
 
         # 2. 下载验证码
-        parsed = urlparse(login_page.url)
         captcha_base = f"{parsed.scheme}://{parsed.netloc}"
         try:
             captcha_resp = session.get(
@@ -172,16 +173,21 @@ def fofa_login():
             time.sleep(1)
             continue
 
-        # 4. 提交登录
-        login_data = {
+        # 4. 构建完整表单数据（包含所有 hidden 字段）
+        login_data = {}
+        login_data.update(hidden_fields)  # utf8, authenticity_token, lt, service, locale
+        login_data.update({
             "username": FOFA_EMAIL,
             "password": FOFA_PASSWORD,
             "_rucaptcha": captcha_text,
             "rememberMe": "1",
             "fofa_service": "1",
-        }
-        if csrf_token:
-            login_data["authenticity_token"] = csrf_token
+        })
+
+        session.headers.update({
+            "Referer": login_page.url,
+            "Origin": f"{parsed.scheme}://{parsed.netloc}",
+        })
 
         try:
             resp = session.post(
@@ -212,10 +218,14 @@ def fofa_login():
             print("  ✅ 登录成功（SSO 回调完成）")
             return session
 
-        if "验证码" in resp.text:
-            print("  ❌ 验证码错误，重试...")
+        if "验证码" in resp.text and ("错误" in resp.text or "不正确" in resp.text or "无效" in resp.text):
+            print("  ❌ 验证码错误")
+        elif resp.status_code == 403:
+            print("  ❌ 403 被拒绝")
+            # 打印响应帮助调试
+            print(f"  响应: {resp.text[:300]}")
         else:
-            print("  ❌ 登录失败，重试...")
+            print("  ❌ 登录失败")
 
         time.sleep(1)
 
@@ -246,7 +256,7 @@ def fofa_search():
     else:
         return []
 
-    if "toLogin" in resp.url or "login" in resp.url:
+    if "login" in resp.url:
         print("⚠️ 仍未登录")
         return []
 
