@@ -6,6 +6,7 @@ import time
 import json
 import base64
 import logging
+import subprocess
 import requests
 import urllib3
 import urllib.parse
@@ -100,19 +101,29 @@ def ocr_captcha(image_bytes):
     return best
 
 
-# ========== Chrome 登录 FOFA ==========
+# ========== Chrome 驱动 ==========
 def create_driver():
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    driver = uc.Chrome(options=options, headless=False)
+
+    # 自动检测 Chrome 版本
+    version_main = None
+    try:
+        output = subprocess.check_output(["google-chrome", "--version"]).decode().strip()
+        version_main = int(output.split()[-1].split(".")[0])
+        log.info(f"检测到 Chrome 版本: {version_main}")
+    except Exception as e:
+        log.info(f"无法检测 Chrome 版本: {e}")
+
+    driver = uc.Chrome(options=options, headless=False, version_main=version_main)
     return driver
 
 
+# ========== Chrome 登录 FOFA ==========
 def fofa_login_and_get_credentials():
-    """用 Chrome 登录 FOFA，返回 (fofa_key, fofa_email, fofa_token)"""
     driver = create_driver()
     fofa_key = None
     fofa_email_found = None
@@ -125,7 +136,6 @@ def fofa_login_and_get_credentials():
             driver.get(LOGIN_PAGE)
             time.sleep(3)
 
-            # 已经跳转到 fofa
             if "fofa.info" in driver.current_url and "login" not in driver.current_url.lower():
                 log.info("  ✅ 已登录")
                 break
@@ -444,7 +454,7 @@ def main():
     log.info("===== 第二步：探测 CF 反代特征 =====")
     cf_ips = []
     for idx, ip in enumerate(ips, 1):
-        log.info(f"[{idx}/{len(ips)}] {ip} ... ")
+        log.info(f"[{idx}/{len(ips)}] {ip} ...")
         if check_cf_proxy(ip):
             log.info(f"  ✅ {ip}")
             cf_ips.append(ip)
