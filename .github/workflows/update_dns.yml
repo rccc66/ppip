@@ -18,12 +18,12 @@ jobs:
           python-version: '3.x'
 
       - name: Install dependencies
-        run: |
-          pip install requests beautifulsoup4
+        run: pip install requests beautifulsoup4 ddddocr Pillow
 
       - name: Run DNS update script
         env:
-          FOFA_COOKIE: ${{ secrets.FOFA_COOKIE }}
+          FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
+          FOFA_PASSWORD: ${{ secrets.FOFA_PASSWORD }}
           ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
