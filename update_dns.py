@@ -1,4 +1,6 @@
 import os
+os.environ["ORT_LOG_LEVEL"] = "ERROR"
+
 import re
 import time
 import base64
@@ -6,6 +8,8 @@ import requests
 import urllib3
 import ddddocr
 from io import BytesIO
+from urllib.parse import urlparse
+from collections import Counter
 from PIL import Image, ImageFilter, ImageEnhance
 from bs4 import BeautifulSoup
 
@@ -27,11 +31,11 @@ CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/d
 ABUSE_THRESHOLD = 20
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f_login"
 
 
 # ========== 验证码识别 ==========
 def preprocess_captcha(image_bytes):
-    """多种预处理方式，返回多个候选图片字节"""
     img = Image.open(BytesIO(image_bytes))
     candidates = []
 
@@ -40,7 +44,7 @@ def preprocess_captcha(image_bytes):
     img.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 方式1: 灰度 + 高对比度 + 二值化
+    # 灰度 + 高对比度 + 二值化
     gray = img.convert("L")
     enhanced = ImageEnhance.Contrast(gray).enhance(2.0)
     bw = enhanced.point(lambda x: 255 if x > 128 else 0, "1")
@@ -48,14 +52,14 @@ def preprocess_captcha(image_bytes):
     bw.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 方式2: 灰度 + 锐化 + 低阈值二值化
+    # 灰度 + 锐化 + 低阈值二值化
     sharp = gray.filter(ImageFilter.SHARPEN)
     bw2 = sharp.point(lambda x: 255 if x > 100 else 0, "1")
     buf = BytesIO()
     bw2.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 方式3: 放大2倍 + 灰度 + 二值化
+    # 放大2倍 + 灰度 + 二值化
     big = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
     big_gray = big.convert("L")
     big_enhanced = ImageEnhance.Contrast(big_gray).enhance(2.5)
@@ -64,7 +68,7 @@ def preprocess_captcha(image_bytes):
     big_bw.save(buf, format="PNG")
     candidates.append(buf.getvalue())
 
-    # 方式4: 中值滤波去噪 + 二值化
+    # 中值滤波去噪 + 二值化
     median = gray.filter(ImageFilter.MedianFilter(3))
     med_bw = median.point(lambda x: 255 if x > 130 else 0, "1")
     buf = BytesIO()
@@ -75,7 +79,6 @@ def preprocess_captcha(image_bytes):
 
 
 def ocr_captcha(image_bytes):
-    """多预处理 + ddddocr 识别，取最可能的结果"""
     ocr = ddddocr.DdddOcr(show_ad=False)
     candidates = preprocess_captcha(image_bytes)
 
@@ -83,7 +86,6 @@ def ocr_captcha(image_bytes):
     for img_data in candidates:
         try:
             text = ocr.classification(img_data)
-            # rucaptcha 是纯字母，5位
             clean = re.sub(r'[^a-zA-Z]', '', text).lower()
             if 4 <= len(clean) <= 6:
                 results.append(clean[:5])
@@ -93,8 +95,6 @@ def ocr_captcha(image_bytes):
     if not results:
         return ""
 
-    # 投票：取出现次数最多的结果
-    from collections import Counter
     counter = Counter(results)
     best = counter.most_common(1)[0][0]
     print(f"    OCR 候选: {results} -> 选择: {best}")
@@ -116,8 +116,9 @@ def fofa_login():
 
         # 1. 访问登录页
         try:
-            login_page = session.get("https://fofa.info/toLogin", timeout=30)
+            login_page = session.get(LOGIN_PAGE, timeout=30, allow_redirects=True)
             login_page.raise_for_status()
+            print(f"  登录页: {login_page.url} ({login_page.status_code})")
         except Exception as e:
             print(f"  访问登录页失败: {e}")
             time.sleep(3)
@@ -135,10 +136,25 @@ def fofa_login():
             if meta:
                 csrf_token = meta.get("content", "")
 
+        # 表单 action
+        form = soup.find("form")
+        action_url = LOGIN_PAGE
+        if form and form.get("action"):
+            action = form.get("action")
+            if action.startswith("/"):
+                parsed = urlparse(login_page.url)
+                action_url = f"{parsed.scheme}://{parsed.netloc}{action}"
+            elif action.startswith("http"):
+                action_url = action
+
+        print(f"  表单: {action_url}")
+
         # 2. 下载验证码
+        parsed = urlparse(login_page.url)
+        captcha_base = f"{parsed.scheme}://{parsed.netloc}"
         try:
             captcha_resp = session.get(
-                f"https://fofa.info/rucaptcha/?t={int(time.time() * 1000)}",
+                f"{captcha_base}/rucaptcha/?t={int(time.time() * 1000)}",
                 timeout=15
             )
             captcha_resp.raise_for_status()
@@ -147,7 +163,7 @@ def fofa_login():
             time.sleep(2)
             continue
 
-        # 3. OCR 识别
+        # 3. OCR
         captcha_text = ocr_captcha(captcha_resp.content)
         print(f"  验证码: {captcha_text}")
 
@@ -167,25 +183,22 @@ def fofa_login():
         if csrf_token:
             login_data["authenticity_token"] = csrf_token
 
-        form = soup.find("form")
-        action_url = "https://fofa.info/toLogin"
-        if form and form.get("action"):
-            action = form.get("action")
-            if action.startswith("/"):
-                action_url = f"https://fofa.info{action}"
-            elif action.startswith("http"):
-                action_url = action
-
         try:
-            resp = session.post(action_url, data=login_data, timeout=30, allow_redirects=True)
+            resp = session.post(
+                action_url,
+                data=login_data,
+                timeout=30,
+                allow_redirects=True,
+            )
         except Exception as e:
-            print(f"  提交登录失败: {e}")
+            print(f"  提交失败: {e}")
             time.sleep(3)
             continue
 
         # 5. 判断结果
         cookies_dict = {c.name: c.value for c in session.cookies}
-        print(f"  状态: {resp.status_code}, Cookies: {list(cookies_dict.keys())}")
+        print(f"  状态: {resp.status_code}, URL: {resp.url}")
+        print(f"  Cookies: {list(cookies_dict.keys())}")
 
         if "fofa_token" in cookies_dict:
             print("  ✅ 登录成功")
@@ -193,6 +206,10 @@ def fofa_login():
 
         if "退出" in resp.text or "个人中心" in resp.text:
             print("  ✅ 登录成功")
+            return session
+
+        if "fofa.info" in resp.url and "login" not in resp.url and "sign_in" not in resp.url:
+            print("  ✅ 登录成功（SSO 回调完成）")
             return session
 
         if "验证码" in resp.text:
@@ -229,7 +246,7 @@ def fofa_search():
     else:
         return []
 
-    if "toLogin" in resp.url:
+    if "toLogin" in resp.url or "login" in resp.url:
         print("⚠️ 仍未登录")
         return []
 
@@ -251,8 +268,7 @@ def fofa_search():
     return ips
 
 
-# ========== 以下不变 ==========
-
+# ========== CF 反代指纹探测 ==========
 def check_cf_proxy(ip):
     try:
         resp = requests.get(f"https://{ip}/cdn-cgi/trace", verify=False, timeout=5)
@@ -270,6 +286,7 @@ def check_cf_proxy(ip):
     return False
 
 
+# ========== AbuseIPDB 检测 ==========
 def abuseipdb_check(ip):
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": 90}
@@ -278,6 +295,7 @@ def abuseipdb_check(ip):
     return resp.json()["data"]["abuseConfidenceScore"]
 
 
+# ========== Cloudflare DNS ==========
 def get_dns_records():
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
@@ -306,6 +324,7 @@ def delete_dns_record(record_id, ip):
     print(f"已删除 DNS 记录: {ip}")
 
 
+# ========== ProxyIP 检测 ==========
 def check_proxy_ips():
     print(f"\n===== 第五步：检测 ProxyIP =====")
     print("等待 30 秒让 DNS 生效...")
@@ -315,6 +334,7 @@ def check_proxy_ips():
         print("没有 DNS 记录需要检测")
         return {}
     all_ips = [r["content"] for r in records]
+    print(f"当前 DNS 中的 IP: {all_ips}")
     ip_status = {}
     for ip in all_ips:
         try:
@@ -334,6 +354,7 @@ def check_proxy_ips():
     return ip_status
 
 
+# ========== 清理失败 IP ==========
 def cleanup_failed_ips(ip_status):
     print(f"\n===== 第六步：清理失败 IP =====")
     failed_ips = [ip for ip, s in ip_status.items() if s == "invalid"]
@@ -349,6 +370,7 @@ def cleanup_failed_ips(ip_status):
                 print(f"❌ 删除失败 {r['content']}: {e}")
 
 
+# ========== 主流程 ==========
 def main():
     print("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
