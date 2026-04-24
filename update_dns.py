@@ -17,7 +17,6 @@ from collections import Counter
 from PIL import Image, ImageFilter, ImageEnhance
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
@@ -123,7 +122,7 @@ def create_driver():
     return driver
 
 
-# ========== 登录 + 搜索一体化 ==========
+# ========== 登录 + 搜索 ==========
 def fofa_search():
     driver = create_driver()
     ips = []
@@ -204,18 +203,14 @@ def fofa_search():
             time.sleep(3)
 
         log.info(f"当前 URL: {driver.current_url}")
-        cookies = driver.get_cookies()
-        log.info(f"Cookies: {[c['name'] for c in cookies]}")
 
-        # ===== 搜索 =====
-        # 方式1: 直接 URL 跳转到搜索结果页
+        # ===== 搜索方式1: URL 直接跳转 =====
         qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
         search_url = f"https://fofa.info/result?qbase64={qbase64}"
         log.info(f"访问搜索页: {search_url}")
         driver.get(search_url)
         time.sleep(5)
 
-        # 等待结果加载
         loaded = False
         for wait_round in range(15):
             page_source = driver.page_source
@@ -225,44 +220,60 @@ def fofa_search():
                 break
             time.sleep(2)
 
+        # ===== 搜索方式2: 搜索框输入 =====
         if not loaded:
-            log.info("  等待超时，尝试截图...")
-            driver.save_screenshot("search_timeout.png")
-            # 再试一次：用搜索框输入查询
-            log.info("  尝试用搜索框搜索...")
-            try:
-                driver.get("https://fofa.info/")
-                time.sleep(3)
+            log.info("  URL 方式未加载数据，尝试搜索框...")
+            driver.save_screenshot("url_method_failed.png")
 
-                search_textarea = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, 'textarea[data-testid="home-search-input"]'))
-                )
-                search_textarea.clear()
-                search_textarea.send_keys(FOFA_QUERY)
-                time.sleep(1)
+            search_selectors = [
+                ('textarea[data-testid="result-search-input"]', 'span[data-testid="result-search-submit"] button'),
+                ('textarea[data-testid="home-search-input"]', 'span[data-testid="home-search-submit"] button'),
+            ]
 
-                # 点击搜索按钮
-                search_btn = driver.find_element(By.CSS_SELECTOR, 'span[data-testid="home-search-submit"] button')
-                search_btn.click()
-                time.sleep(5)
+            for textarea_sel, btn_sel in search_selectors:
+                try:
+                    search_textarea = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, textarea_sel))
+                    )
+                    driver.execute_script("arguments[0].value = '';", search_textarea)
+                    search_textarea.click()
+                    time.sleep(0.5)
+                    driver.execute_script(
+                        "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+                        search_textarea, FOFA_QUERY
+                    )
+                    time.sleep(1)
 
-                # 再等
-                for wait_round in range(15):
-                    page_source = driver.page_source
-                    if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
-                        log.info(f"  搜索框方式数据已加载")
-                        loaded = True
+                    search_btn = driver.find_element(By.CSS_SELECTOR, btn_sel)
+                    search_btn.click()
+                    log.info(f"  点击搜索按钮: {btn_sel}")
+                    time.sleep(5)
+
+                    for wait_round in range(15):
+                        page_source = driver.page_source
+                        if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
+                            log.info("  搜索框方式数据已加载")
+                            loaded = True
+                            break
+                        time.sleep(2)
+
+                    if loaded:
                         break
-                    time.sleep(2)
-            except Exception as e:
-                log.info(f"  搜索框方式失败: {e}")
 
-        # ===== 提取 IP =====
+                except Exception as e:
+                    log.info(f"  搜索框 {textarea_sel} 失败: {e}")
+                    driver.get("https://fofa.info/")
+                    time.sleep(3)
+                    continue
+
+        # ===== 获取最终页面 =====
         page_source = driver.page_source
         log.info(f"页面长度: {len(page_source)}")
+        log.info(f"最终 URL: {driver.current_url}")
 
         if not loaded:
             driver.save_screenshot("no_data.png")
+            log.info("所有搜索方式均未加载数据")
 
     except Exception as e:
         log.error(f"异常: {e}")
@@ -277,7 +288,7 @@ def fofa_search():
         except:
             pass
 
-    # 解析 IP
+    # ===== 解析 IP =====
     if "hsxa-ip" in page_source:
         log.info("从页面提取 IP (BeautifulSoup)...")
         soup = BeautifulSoup(page_source, "html.parser")
@@ -292,12 +303,10 @@ def fofa_search():
 
     if not ips and page_source:
         log.info("尝试正则提取 IP...")
-        # data-clipboard-text 里的 IP
         found = re.findall(r'data-clipboard-text="https?://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', page_source)
         if found:
             ips = found
         else:
-            # 直接匹配 hsxa-jump-a 标签内的 IP
             found = re.findall(r'class="hsxa-jump-a"[^>]*>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})<', page_source)
             if found:
                 ips = found
