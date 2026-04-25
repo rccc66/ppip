@@ -199,6 +199,10 @@ def fofa_search():
                 time.sleep(1)
 
         # ===== 确认在 fofa.info =====
+        if "f_login" in driver.current_url:
+            driver.get("https://fofa.info/")
+            time.sleep(5)
+
         if "fofa.info" not in driver.current_url:
             driver.get("https://fofa.info/")
             time.sleep(3)
