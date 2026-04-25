@@ -480,7 +480,7 @@ def check_proxy_ips():
     return ip_status
 
 
-# ========== CloudflareST 真下载测速（唯一新增）==========
+# ========== CloudflareST 真下载测速（新增）==========
 def run_cloudflare_speedtest(valid_ips):
     if not valid_ips:
         log.info("没有有效 IP 可供 CloudflareST 测速")
@@ -654,7 +654,6 @@ def main():
 
     ip_status = check_proxy_ips()
 
-    # ===== 唯一新增的三行 =====
     valid_ips = [ip for ip, s in ip_status.items() if s == "valid"]
     run_cloudflare_speedtest(valid_ips)
 
