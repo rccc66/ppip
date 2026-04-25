@@ -35,7 +35,7 @@ CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 FOFA_EMAIL = os.getenv("FOFA_EMAIL")
 FOFA_PASSWORD = os.getenv("FOFA_PASSWORD")
 
-FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && asn=="31898" && country=="US" && port="443"'
+FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && country=="US" && port="443" && (asn=="31898" || asn=="16509" || asn=="14618" || asn=="8075")'
 PROXY_CHECK_URL = "https://check.proxyip.cmliussss.net"
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
