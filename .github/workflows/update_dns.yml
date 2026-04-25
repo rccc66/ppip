@@ -27,6 +27,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install requests beautifulsoup4 selenium undetected-chromedriver ddddocr Pillow
 
+      - name: Download CloudflareST
+        run: |
+          wget -O CloudflareST.tar.gz https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/CloudflareST_linux_amd64.tar.gz
+          tar -zxf CloudflareST.tar.gz
+          chmod +x CloudflareST
+
       - name: Run DNS update script
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python update_dns.py 2>&1
         env:
@@ -43,5 +49,8 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: debug-screenshot
-          path: "**/*.png"
+          path: |
+            **/*.png
+            cf_speedtest.csv
+            cf_ips.txt
           if-no-files-found: ignore
