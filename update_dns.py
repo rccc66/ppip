@@ -3,13 +3,11 @@ os.environ["ORT_LOG_LEVEL"] = "ERROR"
 
 import re
 import time
-import json
 import base64
 import logging
 import subprocess
 import requests
 import urllib3
-import urllib.parse
 import ddddocr
 import undetected_chromedriver as uc
 from io import BytesIO
@@ -87,6 +85,7 @@ def ocr_captcha(image_bytes):
     ocr = ddddocr.DdddOcr(show_ad=False)
     candidates = preprocess_captcha(image_bytes)
     results = []
+
     for img_data in candidates:
         try:
             text = ocr.classification(img_data)
@@ -95,8 +94,10 @@ def ocr_captcha(image_bytes):
                 results.append(clean[:5])
         except:
             continue
+
     if not results:
         return ""
+
     counter = Counter(results)
     best = counter.most_common(1)[0][0]
     log.info(f"  OCR 候选: {results} -> {best}")
@@ -509,8 +510,13 @@ def run_cloudflare_speedtest(valid_ips):
         for ip in valid_ips:
             f.write(ip + "\n")
 
+    binary = "./cfst"
+    if not os.path.exists(binary):
+        log.info("未找到 cfst 可执行文件")
+        return []
+
     cmd = [
-        "./CloudflareST",
+        binary,
         "-f", ip_file,
         "-o", result_file,
         "-n", "5",
