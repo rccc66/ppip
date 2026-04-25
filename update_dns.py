@@ -41,10 +41,6 @@ ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 ABUSE_THRESHOLD = 20
 
-# 实验性下载测速参数
-DOWNLOAD_TEST_URL = os.getenv("DOWNLOAD_TEST_URL", "https://speed.cloudflare.com/__down?bytes=200000")
-DOWNLOAD_TEST_TIMEOUT = int(os.getenv("DOWNLOAD_TEST_TIMEOUT", "15"))
-
 LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f_login"
 
 
@@ -374,55 +370,7 @@ def delete_dns_record(record_id, ip):
     log.info(f"已删除 DNS 记录: {ip}")
 
 
-# ========== 实验性下载测速 ==========
-def experimental_download_speed_test(ip):
-    """
-    实验性测速：直接访问 https://IP ，下载响应体，估算吞吐量
-    注意：
-    - 这不是严格意义上的 ProxyIP 实际落地下载速度
-    - 更像“该 IP 直接访问时的响应下载吞吐能力”
-    - 结果仅供参考
-    """
-    start = time.time()
-    total_bytes = 0
-
-    try:
-        resp = requests.get(
-            f"https://{ip}",
-            timeout=DOWNLOAD_TEST_TIMEOUT,
-            verify=False,
-            stream=True,
-            allow_redirects=False,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Host": ip
-            }
-        )
-
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                total_bytes += len(chunk)
-
-        elapsed = time.time() - start
-        if elapsed <= 0:
-            return None
-
-        speed_bps = total_bytes / elapsed
-        speed_kbps = speed_bps / 1024
-        speed_mbps = speed_bps / 1024 / 1024
-
-        return {
-            "bytes": total_bytes,
-            "seconds": elapsed,
-            "kbps": speed_kbps,
-            "mbps": speed_mbps,
-            "status_code": resp.status_code
-        }
-    except Exception:
-        return None
-
-
-# ========== ProxyIP 浏览器检测 + 延迟解析 + 实验性下载测速 ==========
+# ========== ProxyIP 浏览器检测 ==========
 def check_proxy_ips():
     log.info("===== 第五步：检测 ProxyIP =====")
     log.info("等待 30 秒让 DNS 生效...")
@@ -447,14 +395,12 @@ def check_proxy_ips():
         driver.get(PROXY_CHECK_URL)
         time.sleep(3)
 
-        # 输入域名
         input_box = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "inputList"))
         )
         input_box.clear()
         input_box.send_keys(fqdn)
 
-        # 提交
         try:
             submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"], .check-btn, #checkBtn')
             submit_btn.click()
@@ -463,7 +409,6 @@ def check_proxy_ips():
             input_box.send_keys(Keys.RETURN)
             log.info("  回车提交")
 
-        # 等待结果
         log.info("  等待检测结果...")
         last_count = 0
         stable_rounds = 0
@@ -492,15 +437,10 @@ def check_proxy_ips():
         result_items = soup.find_all("div", class_="result-item")
         log.info(f"  找到 {len(result_items)} 个检测结果")
 
-        # 默认全部 invalid
         for ip in all_ips:
             ip_status[ip] = {
                 "status": "invalid",
                 "latency_ms": None,
-                "download_mbps": None,
-                "download_kbps": None,
-                "download_bytes": None,
-                "download_seconds": None
             }
 
         for item in result_items:
@@ -527,10 +467,6 @@ def check_proxy_ips():
                 ip_status[ip] = {
                     "status": "invalid",
                     "latency_ms": None,
-                    "download_mbps": None,
-                    "download_kbps": None,
-                    "download_bytes": None,
-                    "download_seconds": None
                 }
 
             if is_success:
@@ -544,7 +480,6 @@ def check_proxy_ips():
                 ip_status[ip]["latency_ms"] = latency_ms
                 log.info(f"  ❌ {ip} 无效, 延迟: {latency_ms} ms")
 
-        # 延迟排名
         if latency_results:
             latency_results.sort(key=lambda x: x[1])
             log.info("===== ProxyIP 延迟排名（越小越好） =====")
@@ -567,10 +502,6 @@ def check_proxy_ips():
                 ip_status[ip] = {
                     "status": "invalid",
                     "latency_ms": None,
-                    "download_mbps": None,
-                    "download_kbps": None,
-                    "download_bytes": None,
-                    "download_seconds": None
                 }
 
     finally:
@@ -579,45 +510,100 @@ def check_proxy_ips():
         except:
             pass
 
-    # ========== 实验性下载测速 ==========
-    valid_ips = [ip for ip, meta in ip_status.items() if meta.get("status") == "valid"]
-
-    if valid_ips:
-        log.info("===== 实验性下载测速（越大越好，仅供参考） =====")
-        speed_results = []
-
-        for idx, ip in enumerate(valid_ips, 1):
-            log.info(f"[{idx}/{len(valid_ips)}] 测试 {ip} 下载速度...")
-            result = experimental_download_speed_test(ip)
-            if result:
-                ip_status[ip]["download_mbps"] = result["mbps"]
-                ip_status[ip]["download_kbps"] = result["kbps"]
-                ip_status[ip]["download_bytes"] = result["bytes"]
-                ip_status[ip]["download_seconds"] = result["seconds"]
-
-                speed_results.append((ip, result["mbps"]))
-                log.info(
-                    f"  ✅ {ip} 下载测速: "
-                    f"{result['mbps']:.3f} MB/s, "
-                    f"{result['bytes']} bytes / {result['seconds']:.3f}s, "
-                    f"HTTP {result['status_code']}"
-                )
-            else:
-                log.info(f"  ❌ {ip} 下载测速失败")
-
-        if speed_results:
-            speed_results.sort(key=lambda x: x[1], reverse=True)
-            log.info("===== 实验性下载速度排名（越大越好，仅供参考） =====")
-            for idx, (ip, mbps) in enumerate(speed_results, 1):
-                log.info(f"  #{idx} {ip} -> {mbps:.3f} MB/s")
-        else:
-            log.info("没有可用节点可供下载速度排名")
-
     valid_count = sum(1 for v in ip_status.values() if v["status"] == "valid")
     invalid_count = sum(1 for v in ip_status.values() if v["status"] == "invalid")
     log.info(f"  有效: {valid_count}, 无效: {invalid_count}")
 
     return ip_status
+
+
+# ========== CloudflareST 真下载测速 ==========
+def run_cloudflare_speedtest(valid_ips):
+    if not valid_ips:
+        log.info("没有有效 IP 可供 CloudflareST 测速")
+        return []
+
+    log.info("===== 第七步：CloudflareST 真实下载测速 =====")
+
+    ip_file = "cf_ips.txt"
+    result_file = "cf_speedtest.csv"
+
+    with open(ip_file, "w", encoding="utf-8") as f:
+        for ip in valid_ips:
+            f.write(ip + "\n")
+
+    cmd = [
+        "./CloudflareST",
+        "-f", ip_file,
+        "-o", result_file,
+        "-n", "5",
+        "-t", "10",
+        "-tl", "40",
+        "-tu", "150",
+        "-sl", "1",
+        "-dn", "5",
+        "-p", "443",
+    ]
+
+    try:
+        log.info(f"执行命令: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        log.info("CloudflareST 输出：")
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                log.info(line)
+        if result.stderr:
+            for line in result.stderr.splitlines():
+                log.info(f"[stderr] {line}")
+    except Exception as e:
+        log.info(f"CloudflareST 执行失败: {e}")
+        return []
+
+    speed_results = []
+    if os.path.exists(result_file):
+        try:
+            with open(result_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            # 跳过标题行
+            for line in lines[1:]:
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) >= 6:
+                    ip = parts[0]
+                    latency = parts[4]
+                    speed = parts[5]
+                    region = parts[6] if len(parts) > 6 else ""
+
+                    try:
+                        speed_float = float(speed)
+                    except:
+                        speed_float = 0.0
+
+                    speed_results.append({
+                        "ip": ip,
+                        "latency": latency,
+                        "speed_mbps": speed_float,
+                        "region": region
+                    })
+
+            if speed_results:
+                log.info("===== CloudflareST 下载速度排名（越大越好） =====")
+                speed_results.sort(key=lambda x: x["speed_mbps"], reverse=True)
+                for idx, item in enumerate(speed_results, 1):
+                    log.info(
+                        f"  #{idx} {item['ip']} -> "
+                        f"{item['speed_mbps']:.2f} MB/s, "
+                        f"延迟 {item['latency']}, 地区 {item['region']}"
+                    )
+        except Exception as e:
+            log.info(f"解析 CloudflareST 结果失败: {e}")
+
+    return speed_results
 
 
 # ========== 清理 ==========
@@ -682,7 +668,14 @@ def main():
             log.info(f"添加失败 {ip}: {e}")
 
     ip_status = check_proxy_ips()
+
+    # 先测速当前有效节点
+    valid_ips = [ip for ip, meta in ip_status.items() if meta.get("status") == "valid"]
+    run_cloudflare_speedtest(valid_ips)
+
+    # 再清理失败节点
     cleanup_failed_ips(ip_status)
+
     log.info("===== 全部完毕 =====")
 
 
