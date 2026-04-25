@@ -33,6 +33,7 @@ jobs:
           tar -zxf cfst_linux_amd64.tar.gz
           chmod +x cfst
           ls -la
+          ./cfst -h || true
 
       - name: Run DNS update script
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python update_dns.py 2>&1
