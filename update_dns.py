@@ -41,6 +41,10 @@ ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 ABUSE_THRESHOLD = 20
 
+# 实验性下载测速参数
+DOWNLOAD_TEST_URL = os.getenv("DOWNLOAD_TEST_URL", "https://speed.cloudflare.com/__down?bytes=200000")
+DOWNLOAD_TEST_TIMEOUT = int(os.getenv("DOWNLOAD_TEST_TIMEOUT", "15"))
+
 LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f_login"
 
 
@@ -370,7 +374,55 @@ def delete_dns_record(record_id, ip):
     log.info(f"已删除 DNS 记录: {ip}")
 
 
-# ========== ProxyIP 浏览器检测 ==========
+# ========== 实验性下载测速 ==========
+def experimental_download_speed_test(ip):
+    """
+    实验性测速：直接访问 https://IP ，下载响应体，估算吞吐量
+    注意：
+    - 这不是严格意义上的 ProxyIP 实际落地下载速度
+    - 更像“该 IP 直接访问时的响应下载吞吐能力”
+    - 结果仅供参考
+    """
+    start = time.time()
+    total_bytes = 0
+
+    try:
+        resp = requests.get(
+            f"https://{ip}",
+            timeout=DOWNLOAD_TEST_TIMEOUT,
+            verify=False,
+            stream=True,
+            allow_redirects=False,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Host": ip
+            }
+        )
+
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                total_bytes += len(chunk)
+
+        elapsed = time.time() - start
+        if elapsed <= 0:
+            return None
+
+        speed_bps = total_bytes / elapsed
+        speed_kbps = speed_bps / 1024
+        speed_mbps = speed_bps / 1024 / 1024
+
+        return {
+            "bytes": total_bytes,
+            "seconds": elapsed,
+            "kbps": speed_kbps,
+            "mbps": speed_mbps,
+            "status_code": resp.status_code
+        }
+    except Exception:
+        return None
+
+
+# ========== ProxyIP 浏览器检测 + 延迟解析 + 实验性下载测速 ==========
 def check_proxy_ips():
     log.info("===== 第五步：检测 ProxyIP =====")
     log.info("等待 30 秒让 DNS 生效...")
@@ -388,7 +440,8 @@ def check_proxy_ips():
     log.info(f"用浏览器检测域名: {fqdn}")
 
     driver = create_driver()
-    valid_ips = set()
+    ip_status = {}
+    latency_results = []
 
     try:
         driver.get(PROXY_CHECK_URL)
@@ -410,7 +463,7 @@ def check_proxy_ips():
             input_box.send_keys(Keys.RETURN)
             log.info("  回车提交")
 
-        # 等待结果（最多 180 秒）
+        # 等待结果
         log.info("  等待检测结果...")
         last_count = 0
         stable_rounds = 0
@@ -428,7 +481,6 @@ def check_proxy_ips():
                     last_count = current_count
                     log.info(f"  已加载 {current_count} 个结果...")
 
-                # 结果数量稳定 5 轮（10秒没变化）认为加载完成
                 if stable_rounds >= 5:
                     log.info(f"  结果加载完成，共 {current_count} 个")
                     break
@@ -436,23 +488,70 @@ def check_proxy_ips():
         time.sleep(3)
         page_source = driver.page_source
 
-        # 提取结果
         soup = BeautifulSoup(page_source, "html.parser")
         result_items = soup.find_all("div", class_="result-item")
         log.info(f"  找到 {len(result_items)} 个检测结果")
 
+        # 默认全部 invalid
+        for ip in all_ips:
+            ip_status[ip] = {
+                "status": "invalid",
+                "latency_ms": None,
+                "download_mbps": None,
+                "download_kbps": None,
+                "download_bytes": None,
+                "download_seconds": None
+            }
+
         for item in result_items:
             classes = item.get("class", [])
             is_success = "success" in classes
+
             ip_span = item.find("span", class_="result-ip")
-            if ip_span:
-                ip_port = ip_span.get_text(strip=True)
-                ip = ip_port.split(":")[0]
-                if is_success:
-                    valid_ips.add(ip)
-                    log.info(f"  ✅ {ip} 有效")
-                else:
-                    log.info(f"  ❌ {ip} 无效")
+            badge_span = item.find("span", class_=lambda x: x and "status-badge" in x)
+
+            if not ip_span:
+                continue
+
+            ip_port = ip_span.get_text(strip=True)
+            ip = ip_port.split(":")[0]
+
+            latency_ms = None
+            if badge_span:
+                badge_text = badge_span.get_text(strip=True)
+                m = re.search(r'(\d+)\s*ms', badge_text, re.I)
+                if m:
+                    latency_ms = int(m.group(1))
+
+            if ip not in ip_status:
+                ip_status[ip] = {
+                    "status": "invalid",
+                    "latency_ms": None,
+                    "download_mbps": None,
+                    "download_kbps": None,
+                    "download_bytes": None,
+                    "download_seconds": None
+                }
+
+            if is_success:
+                ip_status[ip]["status"] = "valid"
+                ip_status[ip]["latency_ms"] = latency_ms
+                log.info(f"  ✅ {ip} 有效, 延迟: {latency_ms} ms")
+                if latency_ms is not None:
+                    latency_results.append((ip, latency_ms))
+            else:
+                ip_status[ip]["status"] = "invalid"
+                ip_status[ip]["latency_ms"] = latency_ms
+                log.info(f"  ❌ {ip} 无效, 延迟: {latency_ms} ms")
+
+        # 延迟排名
+        if latency_results:
+            latency_results.sort(key=lambda x: x[1])
+            log.info("===== ProxyIP 延迟排名（越小越好） =====")
+            for idx, (ip, latency) in enumerate(latency_results, 1):
+                log.info(f"  #{idx} {ip} -> {latency} ms")
+        else:
+            log.info("没有可用节点可供延迟排名")
 
         driver.save_screenshot("proxyip_result.png")
 
@@ -462,32 +561,74 @@ def check_proxy_ips():
             driver.save_screenshot("proxyip_error.png")
         except:
             pass
+
+        for ip in all_ips:
+            if ip not in ip_status:
+                ip_status[ip] = {
+                    "status": "invalid",
+                    "latency_ms": None,
+                    "download_mbps": None,
+                    "download_kbps": None,
+                    "download_bytes": None,
+                    "download_seconds": None
+                }
+
     finally:
         try:
             driver.quit()
         except:
             pass
 
-    # 构建状态
-    ip_status = {}
-    for ip in all_ips:
-        if ip in valid_ips:
-            ip_status[ip] = "valid"
-        else:
-            ip_status[ip] = "invalid"
+    # ========== 实验性下载测速 ==========
+    valid_ips = [ip for ip, meta in ip_status.items() if meta.get("status") == "valid"]
 
-    log.info(f"  有效: {len(valid_ips)}, 无效: {len(all_ips) - len(valid_ips)}")
+    if valid_ips:
+        log.info("===== 实验性下载测速（越大越好，仅供参考） =====")
+        speed_results = []
+
+        for idx, ip in enumerate(valid_ips, 1):
+            log.info(f"[{idx}/{len(valid_ips)}] 测试 {ip} 下载速度...")
+            result = experimental_download_speed_test(ip)
+            if result:
+                ip_status[ip]["download_mbps"] = result["mbps"]
+                ip_status[ip]["download_kbps"] = result["kbps"]
+                ip_status[ip]["download_bytes"] = result["bytes"]
+                ip_status[ip]["download_seconds"] = result["seconds"]
+
+                speed_results.append((ip, result["mbps"]))
+                log.info(
+                    f"  ✅ {ip} 下载测速: "
+                    f"{result['mbps']:.3f} MB/s, "
+                    f"{result['bytes']} bytes / {result['seconds']:.3f}s, "
+                    f"HTTP {result['status_code']}"
+                )
+            else:
+                log.info(f"  ❌ {ip} 下载测速失败")
+
+        if speed_results:
+            speed_results.sort(key=lambda x: x[1], reverse=True)
+            log.info("===== 实验性下载速度排名（越大越好，仅供参考） =====")
+            for idx, (ip, mbps) in enumerate(speed_results, 1):
+                log.info(f"  #{idx} {ip} -> {mbps:.3f} MB/s")
+        else:
+            log.info("没有可用节点可供下载速度排名")
+
+    valid_count = sum(1 for v in ip_status.values() if v["status"] == "valid")
+    invalid_count = sum(1 for v in ip_status.values() if v["status"] == "invalid")
+    log.info(f"  有效: {valid_count}, 无效: {invalid_count}")
+
     return ip_status
 
 
 # ========== 清理 ==========
 def cleanup_failed_ips(ip_status):
     log.info("===== 第六步：清理失败 IP =====")
-    failed_ips = [ip for ip, s in ip_status.items() if s == "invalid"]
+    failed_ips = [ip for ip, meta in ip_status.items() if meta.get("status") == "invalid"]
     if not failed_ips:
         log.info("所有 IP 正常")
         return
-    log.info(f"需要清理 {len(failed_ips)} 个失败 IP")
+
+    log.info(f"需要清理 {len(failed_ips)} 个失败 IP: {failed_ips}")
     records = get_dns_records()
     for r in records:
         if r["content"] in failed_ips:
@@ -540,7 +681,8 @@ def main():
         except Exception as e:
             log.info(f"添加失败 {ip}: {e}")
 
-    cleanup_failed_ips(check_proxy_ips())
+    ip_status = check_proxy_ips()
+    cleanup_failed_ips(ip_status)
     log.info("===== 全部完毕 =====")
 
 
