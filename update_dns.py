@@ -3,13 +3,11 @@ os.environ["ORT_LOG_LEVEL"] = "ERROR"
 
 import re
 import time
-import json
 import base64
 import logging
 import subprocess
 import requests
 import urllib3
-import urllib.parse
 import ddddocr
 import undetected_chromedriver as uc
 from io import BytesIO
@@ -17,7 +15,6 @@ from collections import Counter
 from PIL import Image, ImageFilter, ImageEnhance
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
@@ -126,6 +123,17 @@ def create_driver():
     return driver
 
 
+# ========== 等待 FOFA 搜索结果 ==========
+def wait_fofa_result(driver, rounds=20):
+    for i in range(rounds):
+        page_source = driver.page_source
+        if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
+            log.info(f"  数据已加载 (等待 {(i + 1) * 2}s)")
+            return True
+        time.sleep(2)
+    return False
+
+
 # ========== FOFA 登录 + 搜索 ==========
 def fofa_search():
     driver = create_driver()
@@ -201,80 +209,33 @@ def fofa_search():
                 log.info("  ❌ 验证码错误或登录失败")
                 time.sleep(1)
 
-        # ===== 确认在 fofa.info =====
+        # ===== 关键修复：如果停留在 f_login，主动回首页 =====
+        if "fofa.info/f_login" in driver.current_url:
+            log.info("检测到仍停留在 f_login 回调页，主动跳转首页...")
+            driver.get("https://fofa.info/")
+            time.sleep(5)
+
         if "fofa.info" not in driver.current_url:
             driver.get("https://fofa.info/")
-            time.sleep(3)
+            time.sleep(5)
 
         log.info(f"当前 URL: {driver.current_url}")
 
-        # ===== 搜索方式1: URL 直接跳转 =====
+        # ===== 只用 URL 搜索，避免首页/结果页搜索框混乱 =====
         qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
         search_url = f"https://fofa.info/result?qbase64={qbase64}"
         log.info(f"访问搜索页: {search_url}")
         driver.get(search_url)
         time.sleep(5)
 
-        loaded = False
-        for wait_round in range(15):
-            page_source = driver.page_source
-            if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
-                log.info(f"  数据已加载 (等待 {(wait_round + 1) * 2}s)")
-                loaded = True
-                break
-            time.sleep(2)
-
-        # ===== 搜索方式2: 搜索框输入 =====
-        if not loaded:
-            log.info("  URL 方式未加载数据，尝试搜索框...")
-            driver.save_screenshot("url_method_failed.png")
-
-            search_selectors = [
-                ('textarea[data-testid="result-search-input"]', 'span[data-testid="result-search-submit"] button'),
-                ('textarea[data-testid="home-search-input"]', 'span[data-testid="home-search-submit"] button'),
-            ]
-
-            for textarea_sel, btn_sel in search_selectors:
-                try:
-                    search_textarea = WebDriverWait(driver, 5).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, textarea_sel))
-                    )
-                    driver.execute_script("arguments[0].value = '';", search_textarea)
-                    search_textarea.click()
-                    time.sleep(0.5)
-                    driver.execute_script(
-                        "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-                        search_textarea, FOFA_QUERY
-                    )
-                    time.sleep(1)
-
-                    search_btn = driver.find_element(By.CSS_SELECTOR, btn_sel)
-                    search_btn.click()
-                    log.info(f"  点击搜索按钮: {btn_sel}")
-                    time.sleep(5)
-
-                    for wait_round in range(15):
-                        page_source = driver.page_source
-                        if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
-                            log.info("  搜索框方式数据已加载")
-                            loaded = True
-                            break
-                        time.sleep(2)
-
-                    if loaded:
-                        break
-                except Exception as e:
-                    log.info(f"  搜索框 {textarea_sel} 失败: {e}")
-                    driver.get("https://fofa.info/")
-                    time.sleep(3)
-                    continue
+        loaded = wait_fofa_result(driver, rounds=20)
 
         page_source = driver.page_source
         log.info(f"页面长度: {len(page_source)}, URL: {driver.current_url}")
 
         if not loaded:
             driver.save_screenshot("no_data.png")
-            log.info("所有搜索方式均未加载数据")
+            log.info("URL 方式未加载出结果数据")
 
     except Exception as e:
         log.error(f"异常: {e}")
@@ -499,16 +460,16 @@ def run_cloudflare_speedtest(valid_ips):
 
     cmd = [
         binary,
-        "-f", ip_file,          # IP 列表文件
-        "-o", result_file,      # 结果输出文件
-        "-n", "200",            # 延迟测速线程
-        "-t", "4",              # 延迟测速次数
-        "-dn", "10",            # 下载测速数量
-        "-dt", "10",            # 下载测速时间（秒）
-        "-tp", "443",           # 测速端口
-        "-tl", "300",           # 平均延迟上限
-        "-sl", "0",             # 下载速度下限（MB/s）=> 先看全部结果
-        "-p", "10",             # 显示结果数量
+        "-f", ip_file,
+        "-o", result_file,
+        "-n", "200",
+        "-t", "4",
+        "-dn", "10",
+        "-dt", "10",
+        "-tp", "443",
+        "-tl", "300",
+        "-sl", "0",
+        "-p", "10",
         "-allip",
         "-url", "http://speed.cloudflare.com/__down?bytes=99999999",
     ]
@@ -543,8 +504,6 @@ def run_cloudflare_speedtest(valid_ips):
                     continue
 
                 parts = [x.strip() for x in line.split(",")]
-                # 常见格式:
-                # IP地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
                 if len(parts) >= 6:
                     ip = parts[0]
                     sent = parts[1] if len(parts) > 1 else ""
