@@ -129,7 +129,6 @@ def fofa_search():
     ips = []
 
     try:
-        # ===== 登录 =====
         for attempt in range(10):
             log.info(f"登录尝试 {attempt + 1}/10 ...")
 
@@ -198,14 +197,12 @@ def fofa_search():
                 log.info("  ❌ 验证码错误或登录失败")
                 time.sleep(1)
 
-        # ===== 确认在 fofa.info =====
         if "fofa.info" not in driver.current_url:
             driver.get("https://fofa.info/")
             time.sleep(3)
 
         log.info(f"当前 URL: {driver.current_url}")
 
-        # ===== 搜索方式1: URL 直接跳转 =====
         qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
         search_url = f"https://fofa.info/result?qbase64={qbase64}"
         log.info(f"访问搜索页: {search_url}")
@@ -221,7 +218,6 @@ def fofa_search():
                 break
             time.sleep(2)
 
-        # ===== 搜索方式2: 搜索框输入 =====
         if not loaded:
             log.info("  URL 方式未加载数据，尝试搜索框...")
             driver.save_screenshot("url_method_failed.png")
@@ -286,7 +282,6 @@ def fofa_search():
         except:
             pass
 
-    # ===== 解析 IP =====
     if "hsxa-ip" in page_source:
         log.info("从页面提取 IP (BeautifulSoup)...")
         soup = BeautifulSoup(page_source, "html.parser")
@@ -312,24 +307,6 @@ def fofa_search():
     ips = list(dict.fromkeys(ips))
     log.info(f"提取到 {len(ips)} 个去重IP")
     return ips
-
-
-# ========== CF 反代探测 ==========
-def check_cf_proxy(ip):
-    try:
-        resp = requests.get(f"https://{ip}/cdn-cgi/trace", verify=False, timeout=5)
-        if "cloudflare" in resp.text.lower():
-            return True
-    except:
-        pass
-    for scheme in ["http", "https"]:
-        try:
-            resp = requests.head(f"{scheme}://{ip}", verify=False, timeout=5)
-            if "cloudflare" in resp.headers.get("Server", "").lower():
-                return True
-        except:
-            continue
-    return False
 
 
 # ========== AbuseIPDB ==========
@@ -372,7 +349,7 @@ def delete_dns_record(record_id, ip):
 
 # ========== ProxyIP 浏览器检测 ==========
 def check_proxy_ips():
-    log.info("===== 第五步：检测 ProxyIP =====")
+    log.info("===== 第四步：检测 ProxyIP =====")
     log.info("等待 30 秒让 DNS 生效...")
     time.sleep(30)
 
@@ -523,7 +500,7 @@ def run_cloudflare_speedtest(valid_ips):
         log.info("没有有效 IP 可供 CloudflareST 测速")
         return []
 
-    log.info("===== 第七步：CloudflareST 真实下载测速 =====")
+    log.info("===== 第五步：CloudflareST 真实下载测速 =====")
 
     ip_file = "cf_ips.txt"
     result_file = "cf_speedtest.csv"
@@ -566,7 +543,6 @@ def run_cloudflare_speedtest(valid_ips):
             with open(result_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
 
-            # 跳过标题行
             for line in lines[1:]:
                 line = line.strip()
                 if not line:
@@ -632,22 +608,9 @@ def main():
     if not ips:
         return
 
-    log.info("===== 第二步：探测 CF 反代特征 =====")
-    cf_ips = []
-    for idx, ip in enumerate(ips, 1):
-        log.info(f"[{idx}/{len(ips)}] {ip} ...")
-        if check_cf_proxy(ip):
-            log.info(f"  ✅ {ip}")
-            cf_ips.append(ip)
-        else:
-            log.info(f"  ❌ {ip}")
-    log.info(f"CF 节点: {len(cf_ips)} 个")
-    if not cf_ips:
-        return
-
-    log.info("===== 第三步：AbuseIPDB 检测 =====")
+    log.info("===== 第二步：AbuseIPDB 检测 =====")
     clean_ips = []
-    for ip in cf_ips:
+    for ip in ips:
         try:
             score = abuseipdb_check(ip)
             log.info(f"  {ip} 评分: {score}")
@@ -656,10 +619,12 @@ def main():
             time.sleep(0.5)
         except Exception as e:
             log.info(f"  {ip} 失败: {e}")
+
+    log.info(f"AbuseIPDB 通过 {len(clean_ips)} 个IP: {clean_ips}")
     if not clean_ips:
         return
 
-    log.info("===== 第四步：添加 DNS =====")
+    log.info("===== 第三步：添加 DNS =====")
     for ip in clean_ips:
         try:
             create_dns_record(ip)
@@ -669,11 +634,9 @@ def main():
 
     ip_status = check_proxy_ips()
 
-    # 先测速当前有效节点
     valid_ips = [ip for ip, meta in ip_status.items() if meta.get("status") == "valid"]
     run_cloudflare_speedtest(valid_ips)
 
-    # 再清理失败节点
     cleanup_failed_ips(ip_status)
 
     log.info("===== 全部完毕 =====")
