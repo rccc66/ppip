@@ -3,11 +3,13 @@ os.environ["ORT_LOG_LEVEL"] = "ERROR"
 
 import re
 import time
+import json
 import base64
 import logging
 import subprocess
 import requests
 import urllib3
+import urllib.parse
 import ddddocr
 import undetected_chromedriver as uc
 from io import BytesIO
@@ -15,6 +17,7 @@ from collections import Counter
 from PIL import Image, ImageFilter, ImageEnhance
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
@@ -84,7 +87,6 @@ def ocr_captcha(image_bytes):
     ocr = ddddocr.DdddOcr(show_ad=False)
     candidates = preprocess_captcha(image_bytes)
     results = []
-
     for img_data in candidates:
         try:
             text = ocr.classification(img_data)
@@ -93,10 +95,8 @@ def ocr_captcha(image_bytes):
                 results.append(clean[:5])
         except:
             continue
-
     if not results:
         return ""
-
     counter = Counter(results)
     best = counter.most_common(1)[0][0]
     log.info(f"  OCR 候选: {results} -> {best}")
@@ -121,17 +121,6 @@ def create_driver():
 
     driver = uc.Chrome(options=options, headless=False, version_main=version_main)
     return driver
-
-
-# ========== 等待 FOFA 搜索结果 ==========
-def wait_fofa_result(driver, rounds=20):
-    for i in range(rounds):
-        page_source = driver.page_source
-        if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
-            log.info(f"  数据已加载 (等待 {(i + 1) * 2}s)")
-            return True
-        time.sleep(2)
-    return False
 
 
 # ========== FOFA 登录 + 搜索 ==========
@@ -209,33 +198,80 @@ def fofa_search():
                 log.info("  ❌ 验证码错误或登录失败")
                 time.sleep(1)
 
-        # ===== 关键修复：如果停留在 f_login，主动回首页 =====
-        if "fofa.info/f_login" in driver.current_url:
-            log.info("检测到仍停留在 f_login 回调页，主动跳转首页...")
-            driver.get("https://fofa.info/")
-            time.sleep(5)
-
+        # ===== 确认在 fofa.info =====
         if "fofa.info" not in driver.current_url:
             driver.get("https://fofa.info/")
-            time.sleep(5)
+            time.sleep(3)
 
         log.info(f"当前 URL: {driver.current_url}")
 
-        # ===== 只用 URL 搜索，避免首页/结果页搜索框混乱 =====
+        # ===== 搜索方式1: URL 直接跳转 =====
         qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
         search_url = f"https://fofa.info/result?qbase64={qbase64}"
         log.info(f"访问搜索页: {search_url}")
         driver.get(search_url)
         time.sleep(5)
 
-        loaded = wait_fofa_result(driver, rounds=20)
+        loaded = False
+        for wait_round in range(15):
+            page_source = driver.page_source
+            if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
+                log.info(f"  数据已加载 (等待 {(wait_round + 1) * 2}s)")
+                loaded = True
+                break
+            time.sleep(2)
+
+        # ===== 搜索方式2: 搜索框输入 =====
+        if not loaded:
+            log.info("  URL 方式未加载数据，尝试搜索框...")
+            driver.save_screenshot("url_method_failed.png")
+
+            search_selectors = [
+                ('textarea[data-testid="result-search-input"]', 'span[data-testid="result-search-submit"] button'),
+                ('textarea[data-testid="home-search-input"]', 'span[data-testid="home-search-submit"] button'),
+            ]
+
+            for textarea_sel, btn_sel in search_selectors:
+                try:
+                    search_textarea = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, textarea_sel))
+                    )
+                    driver.execute_script("arguments[0].value = '';", search_textarea)
+                    search_textarea.click()
+                    time.sleep(0.5)
+                    driver.execute_script(
+                        "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+                        search_textarea, FOFA_QUERY
+                    )
+                    time.sleep(1)
+
+                    search_btn = driver.find_element(By.CSS_SELECTOR, btn_sel)
+                    search_btn.click()
+                    log.info(f"  点击搜索按钮: {btn_sel}")
+                    time.sleep(5)
+
+                    for wait_round in range(15):
+                        page_source = driver.page_source
+                        if "hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source:
+                            log.info("  搜索框方式数据已加载")
+                            loaded = True
+                            break
+                        time.sleep(2)
+
+                    if loaded:
+                        break
+                except Exception as e:
+                    log.info(f"  搜索框 {textarea_sel} 失败: {e}")
+                    driver.get("https://fofa.info/")
+                    time.sleep(3)
+                    continue
 
         page_source = driver.page_source
         log.info(f"页面长度: {len(page_source)}, URL: {driver.current_url}")
 
         if not loaded:
             driver.save_screenshot("no_data.png")
-            log.info("URL 方式未加载出结果数据")
+            log.info("所有搜索方式均未加载数据")
 
     except Exception as e:
         log.error(f"异常: {e}")
@@ -358,12 +394,14 @@ def check_proxy_ips():
         driver.get(PROXY_CHECK_URL)
         time.sleep(3)
 
+        # 输入域名
         input_box = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "inputList"))
         )
         input_box.clear()
         input_box.send_keys(fqdn)
 
+        # 提交
         try:
             submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"], .check-btn, #checkBtn')
             submit_btn.click()
@@ -372,6 +410,7 @@ def check_proxy_ips():
             input_box.send_keys(Keys.RETURN)
             log.info("  回车提交")
 
+        # 等待结果（最多 180 秒）
         log.info("  等待检测结果...")
         last_count = 0
         stable_rounds = 0
@@ -389,6 +428,7 @@ def check_proxy_ips():
                     last_count = current_count
                     log.info(f"  已加载 {current_count} 个结果...")
 
+                # 结果数量稳定 5 轮（10秒没变化）认为加载完成
                 if stable_rounds >= 5:
                     log.info(f"  结果加载完成，共 {current_count} 个")
                     break
@@ -396,6 +436,7 @@ def check_proxy_ips():
         time.sleep(3)
         page_source = driver.page_source
 
+        # 提取结果
         soup = BeautifulSoup(page_source, "html.parser")
         result_items = soup.find_all("div", class_="result-item")
         log.info(f"  找到 {len(result_items)} 个检测结果")
@@ -427,6 +468,7 @@ def check_proxy_ips():
         except:
             pass
 
+    # 构建状态
     ip_status = {}
     for ip in all_ips:
         if ip in valid_ips:
@@ -436,117 +478,6 @@ def check_proxy_ips():
 
     log.info(f"  有效: {len(valid_ips)}, 无效: {len(all_ips) - len(valid_ips)}")
     return ip_status
-
-
-# ========== CloudflareST 真下载测速 ==========
-def run_cloudflare_speedtest(valid_ips):
-    if not valid_ips:
-        log.info("没有有效 IP 可供 CloudflareST 测速")
-        return []
-
-    log.info("===== 第七步：CloudflareST 真实下载测速 =====")
-
-    ip_file = "cf_ips.txt"
-    result_file = "cf_speedtest.csv"
-
-    with open(ip_file, "w", encoding="utf-8") as f:
-        for ip in valid_ips:
-            f.write(ip + "\n")
-
-    binary = "./cfst"
-    if not os.path.exists(binary):
-        log.info("未找到 cfst 可执行文件")
-        return []
-
-    cmd = [
-        binary,
-        "-f", ip_file,
-        "-o", result_file,
-        "-n", "200",
-        "-t", "4",
-        "-dn", "10",
-        "-dt", "10",
-        "-tp", "443",
-        "-tl", "300",
-        "-sl", "0",
-        "-p", "10",
-        "-allip",
-        "-url", "http://speed.cloudflare.com/__down?bytes=99999999",
-    ]
-
-    try:
-        log.info(f"执行命令: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-
-        log.info("CloudflareST 输出：")
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                log.info(line)
-        if result.stderr:
-            for line in result.stderr.splitlines():
-                log.info(f"[stderr] {line}")
-
-        if result.returncode != 0:
-            log.info(f"CloudflareST 返回非 0 状态码: {result.returncode}")
-    except Exception as e:
-        log.info(f"CloudflareST 执行失败: {e}")
-        return []
-
-    speed_results = []
-    if os.path.exists(result_file):
-        try:
-            with open(result_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-
-            for line in lines[1:]:
-                line = line.strip()
-                if not line:
-                    continue
-
-                parts = [x.strip() for x in line.split(",")]
-                if len(parts) >= 6:
-                    ip = parts[0]
-                    sent = parts[1] if len(parts) > 1 else ""
-                    recv = parts[2] if len(parts) > 2 else ""
-                    loss = parts[3] if len(parts) > 3 else ""
-                    latency = parts[4] if len(parts) > 4 else ""
-                    speed = parts[5] if len(parts) > 5 else ""
-                    region = parts[6] if len(parts) > 6 else ""
-
-                    try:
-                        speed_float = float(speed)
-                    except:
-                        speed_float = 0.0
-
-                    speed_results.append({
-                        "ip": ip,
-                        "sent": sent,
-                        "recv": recv,
-                        "loss": loss,
-                        "latency": latency,
-                        "speed_mbps": speed_float,
-                        "region": region
-                    })
-
-            if speed_results:
-                log.info("===== CloudflareST 下载速度排名（越大越好） =====")
-                speed_results.sort(key=lambda x: x["speed_mbps"], reverse=True)
-                for idx, item in enumerate(speed_results, 1):
-                    log.info(
-                        f"  #{idx} {item['ip']} -> "
-                        f"{item['speed_mbps']:.2f} MB/s, "
-                        f"延迟 {item['latency']}, "
-                        f"丢包 {item['loss']}, "
-                        f"地区 {item['region']}"
-                    )
-            else:
-                log.info("cf_speedtest.csv 存在，但没有解析到测速结果")
-        except Exception as e:
-            log.info(f"解析 CloudflareST 结果失败: {e}")
-    else:
-        log.info("未生成 cf_speedtest.csv，可能测速未成功")
-
-    return speed_results
 
 
 # ========== 清理 ==========
@@ -609,12 +540,7 @@ def main():
         except Exception as e:
             log.info(f"添加失败 {ip}: {e}")
 
-    ip_status = check_proxy_ips()
-
-    valid_ips = [ip for ip, meta in ip_status.items() if meta == "valid"]
-    run_cloudflare_speedtest(valid_ips)
-
-    cleanup_failed_ips(ip_status)
+    cleanup_failed_ips(check_proxy_ips())
     log.info("===== 全部完毕 =====")
 
 
