@@ -517,20 +517,23 @@ def run_cloudflare_speedtest(valid_ips):
 
     cmd = [
         binary,
-        "-f", ip_file,
-        "-o", result_file,
-        "-n", "5",
-        "-t", "10",
-        "-tl", "40",
-        "-tu", "150",
-        "-sl", "1",
-        "-dn", "5",
-        "-p", "443",
+        "-f", ip_file,     # IP 列表文件
+        "-o", result_file, # 结果输出文件
+        "-n", "200",       # 延迟测速线程
+        "-t", "4",         # 延迟测速次数
+        "-dn", "5",        # 下载测速数量
+        "-dt", "10",       # 下载测速时间（秒）
+        "-tp", "443",      # 测速端口
+        "-tll", "40",      # 平均延迟下限
+        "-tl", "150",      # 平均延迟上限
+        "-sl", "1",        # 下载速度下限（MB/s）
+        "-p", "10",        # 显示结果数量
+        "-allip",          # 测速全部 IP
     ]
 
     try:
         log.info(f"执行命令: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
 
         log.info("CloudflareST 输出：")
         if result.stdout:
@@ -539,6 +542,9 @@ def run_cloudflare_speedtest(valid_ips):
         if result.stderr:
             for line in result.stderr.splitlines():
                 log.info(f"[stderr] {line}")
+
+        if result.returncode != 0:
+            log.info(f"CloudflareST 返回非 0 状态码: {result.returncode}")
     except Exception as e:
         log.info(f"CloudflareST 执行失败: {e}")
         return []
@@ -555,10 +561,15 @@ def run_cloudflare_speedtest(valid_ips):
                     continue
 
                 parts = [x.strip() for x in line.split(",")]
+                # 常见格式:
+                # IP地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
                 if len(parts) >= 6:
                     ip = parts[0]
-                    latency = parts[4]
-                    speed = parts[5]
+                    sent = parts[1] if len(parts) > 1 else ""
+                    recv = parts[2] if len(parts) > 2 else ""
+                    loss = parts[3] if len(parts) > 3 else ""
+                    latency = parts[4] if len(parts) > 4 else ""
+                    speed = parts[5] if len(parts) > 5 else ""
                     region = parts[6] if len(parts) > 6 else ""
 
                     try:
@@ -568,6 +579,9 @@ def run_cloudflare_speedtest(valid_ips):
 
                     speed_results.append({
                         "ip": ip,
+                        "sent": sent,
+                        "recv": recv,
+                        "loss": loss,
                         "latency": latency,
                         "speed_mbps": speed_float,
                         "region": region
@@ -580,10 +594,16 @@ def run_cloudflare_speedtest(valid_ips):
                     log.info(
                         f"  #{idx} {item['ip']} -> "
                         f"{item['speed_mbps']:.2f} MB/s, "
-                        f"延迟 {item['latency']}, 地区 {item['region']}"
+                        f"延迟 {item['latency']}, "
+                        f"丢包 {item['loss']}, "
+                        f"地区 {item['region']}"
                     )
+            else:
+                log.info("cf_speedtest.csv 存在，但没有解析到测速结果")
         except Exception as e:
             log.info(f"解析 CloudflareST 结果失败: {e}")
+    else:
+        log.info("未生成 cf_speedtest.csv，可能测速未成功")
 
     return speed_results
 
