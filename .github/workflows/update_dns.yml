@@ -27,7 +27,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install requests beautifulsoup4 selenium undetected-chromedriver ddddocr Pillow
 
-      - name: Download CloudflareST
+      - name: Download cfst
         run: |
           wget -N https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
           tar -zxf cfst_linux_amd64.tar.gz
@@ -45,7 +45,7 @@ jobs:
           CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
           CLOUDFLARE_DNS_NAME: us
 
-      - name: Upload debug screenshot
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v5
         with:
