@@ -480,6 +480,119 @@ def check_proxy_ips():
     return ip_status
 
 
+# ========== CloudflareST 真下载测速 ==========
+def run_cloudflare_speedtest(valid_ips):
+    if not valid_ips:
+        log.info("没有有效 IP 可供 CloudflareST 测速")
+        return []
+
+    log.info("===== 第七步：CloudflareST 真实下载测速 =====")
+
+    ip_file = "cf_ips.txt"
+    result_file = "cf_speedtest.csv"
+
+    with open(ip_file, "w", encoding="utf-8") as f:
+        for ip in valid_ips:
+            f.write(ip + "\n")
+
+    binary = "./cfst"
+    if not os.path.exists(binary):
+        log.info("未找到 cfst 可执行文件")
+        return []
+
+    cmd = [
+        binary,
+        "-f", ip_file,          # IP 列表文件
+        "-o", result_file,      # 结果输出文件
+        "-n", "200",            # 延迟测速线程
+        "-t", "4",              # 延迟测速次数
+        "-dn", "10",            # 下载测速数量
+        "-dt", "10",            # 下载测速时间（秒）
+        "-tp", "443",           # 测速端口
+        "-tl", "300",           # 平均延迟上限
+        "-sl", "0",             # 下载速度下限（先看全部结果）
+        "-p", "10",             # 显示结果数量
+        "-allip",
+        "-url", "http://speed.cloudflare.com/__down?bytes=99999999",
+    ]
+
+    try:
+        log.info(f"执行命令: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+
+        log.info("CloudflareST 输出：")
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                log.info(line)
+        if result.stderr:
+            for line in result.stderr.splitlines():
+                log.info(f"[stderr] {line}")
+
+        if result.returncode != 0:
+            log.info(f"CloudflareST 返回非 0 状态码: {result.returncode}")
+    except Exception as e:
+        log.info(f"CloudflareST 执行失败: {e}")
+        return []
+
+    speed_results = []
+    if os.path.exists(result_file):
+        try:
+            with open(result_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            for line in lines[1:]:
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = [x.strip() for x in line.split(",")]
+                # 常见格式:
+                # IP地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
+                if len(parts) >= 6:
+                    ip = parts[0]
+                    sent = parts[1] if len(parts) > 1 else ""
+                    recv = parts[2] if len(parts) > 2 else ""
+                    loss = parts[3] if len(parts) > 3 else ""
+                    latency = parts[4] if len(parts) > 4 else ""
+                    speed = parts[5] if len(parts) > 5 else ""
+                    region = parts[6] if len(parts) > 6 else ""
+
+                    try:
+                        speed_float = float(speed)
+                    except:
+                        speed_float = 0.0
+
+                    speed_results.append({
+                        "ip": ip,
+                        "sent": sent,
+                        "recv": recv,
+                        "loss": loss,
+                        "latency": latency,
+                        "speed_mbps": speed_float,
+                        "region": region
+                    })
+
+            if speed_results:
+                log.info("===== CloudflareST 下载速度排名（越大越好） =====")
+                speed_results.sort(key=lambda x: x["speed_mbps"], reverse=True)
+                for idx, item in enumerate(speed_results, 1):
+                    log.info(
+                        f"  #{idx} {item['ip']} -> "
+                        f"{item['speed_mbps']:.2f} MB/s, "
+                        f"延迟 {item['latency']}, "
+                        f"丢包 {item['loss']}, "
+                        f"地区 {item['region']}"
+                    )
+            else:
+                log.info("cf_speedtest.csv 存在，但没有解析到测速结果")
+        except Exception as e:
+            log.info(f"解析 CloudflareST 结果失败: {e}")
+    else:
+        log.info("未生成 cf_speedtest.csv，可能测速未成功")
+
+    return speed_results
+
+
 # ========== 清理 ==========
 def cleanup_failed_ips(ip_status):
     log.info("===== 第六步：清理失败 IP =====")
@@ -540,7 +653,12 @@ def main():
         except Exception as e:
             log.info(f"添加失败 {ip}: {e}")
 
-    cleanup_failed_ips(check_proxy_ips())
+    ip_status = check_proxy_ips()
+
+    valid_ips = [ip for ip, meta in ip_status.items() if meta == "valid"]
+    run_cloudflare_speedtest(valid_ips)
+
+    cleanup_failed_ips(ip_status)
     log.info("===== 全部完毕 =====")
 
 
