@@ -29,9 +29,10 @@ jobs:
 
       - name: Download CloudflareST
         run: |
-          wget -O CloudflareST.tar.gz https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/CloudflareST_linux_amd64.tar.gz
-          tar -zxf CloudflareST.tar.gz
-          chmod +x CloudflareST
+          wget -N https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
+          tar -zxf cfst_linux_amd64.tar.gz
+          chmod +x cfst
+          ls -la
 
       - name: Run DNS update script
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python update_dns.py 2>&1
