@@ -3,11 +3,13 @@ os.environ["ORT_LOG_LEVEL"] = "ERROR"
 
 import re
 import time
+import json
 import base64
 import logging
 import subprocess
 import requests
 import urllib3
+import urllib.parse
 import ddddocr
 import undetected_chromedriver as uc
 from io import BytesIO
@@ -124,28 +126,18 @@ def create_driver():
     return driver
 
 
-# ========== 等待 FOFA 结果加载 ==========
-def wait_result_loaded(driver, timeout_rounds=20):
-    for wait_round in range(timeout_rounds):
-        page_source = driver.page_source
-        current_url = driver.current_url
-
-        if ("hsxa-ip" in page_source or "hsxa-meta-data-item" in page_source) and "/result" in current_url:
-            log.info(f"  数据已加载 (等待 {(wait_round + 1) * 2}s)")
-            return True
-
-        time.sleep(2)
-
-    return False
-
-
-# ========== FOFA 登录 + 搜索 ==========
-def fofa_search():
+# ========== 浏览器登录，提取 cookie/token/key ==========
+def login_and_get_auth():
     driver = create_driver()
-    ips = []
+    result = {
+        "cookies": {},
+        "fofa_token": None,
+        "fofa_refresh_token": None,
+        "user_key": None,
+        "user_email": FOFA_EMAIL,
+    }
 
     try:
-        # ===== 登录 =====
         for attempt in range(10):
             log.info(f"登录尝试 {attempt + 1}/10 ...")
 
@@ -214,7 +206,6 @@ def fofa_search():
                 log.info("  ❌ 验证码错误或登录失败")
                 time.sleep(1)
 
-        # ===== 确保真正进入首页 =====
         if "fofa.info/f_login" in driver.current_url:
             log.info("检测到仍停留在 f_login 回调页，主动跳转首页...")
             driver.get("https://fofa.info/")
@@ -226,98 +217,63 @@ def fofa_search():
 
         log.info(f"当前 URL: {driver.current_url}")
 
-        loaded = False
+        cookies = driver.get_cookies()
+        for c in cookies:
+            result["cookies"][c["name"]] = c["value"]
 
-        # ===== 搜索方式1：优先首页搜索框 =====
-        try:
-            home_textarea = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'textarea[data-testid="home-search-input"]'))
-            )
-            driver.execute_script("arguments[0].value = '';", home_textarea)
-            home_textarea.click()
-            time.sleep(0.5)
-            driver.execute_script(
-                "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-                home_textarea, FOFA_QUERY
-            )
-            time.sleep(1)
+        result["fofa_token"] = result["cookies"].get("fofa_token")
+        result["fofa_refresh_token"] = result["cookies"].get("fofa_refresh_token")
 
-            home_btn = driver.find_element(By.CSS_SELECTOR, 'span[data-testid="home-search-submit"] button')
-            home_btn.click()
-            log.info("  点击首页搜索按钮")
-            time.sleep(3)
-
-            # 等待 URL 切换到 /result
-            for _ in range(10):
-                if "/result" in driver.current_url:
-                    break
-                time.sleep(1)
-
-            loaded = wait_result_loaded(driver)
-
-        except Exception as e:
-            log.info(f"  首页搜索框失败: {e}")
-
-        # ===== 搜索方式2：直接 URL =====
-        if not loaded:
-            qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
-            search_url = f"https://fofa.info/result?qbase64={qbase64}"
-            log.info(f"  首页搜索未成功，尝试直接访问搜索页: {search_url}")
-            driver.get(search_url)
-            time.sleep(5)
-            loaded = wait_result_loaded(driver)
-
-        # ===== 搜索方式3：结果页搜索框 =====
-        if not loaded:
-            log.info("  URL 方式未加载数据，尝试结果页搜索框...")
-            driver.save_screenshot("url_method_failed.png")
-
+        user_raw = result["cookies"].get("user")
+        if user_raw:
             try:
-                result_textarea = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, 'textarea[data-testid="result-search-input"]'))
-                )
-                driver.execute_script("arguments[0].value = '';", result_textarea)
-                result_textarea.click()
-                time.sleep(0.5)
-                driver.execute_script(
-                    "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-                    result_textarea, FOFA_QUERY
-                )
-                time.sleep(1)
-
-                result_btn = driver.find_element(By.CSS_SELECTOR, 'span[data-testid="result-search-submit"] button')
-                result_btn.click()
-                log.info("  点击结果页搜索按钮")
-                time.sleep(3)
-
-                loaded = wait_result_loaded(driver)
+                user_data = json.loads(urllib.parse.unquote(user_raw))
+                result["user_key"] = user_data.get("key")
+                result["user_email"] = user_data.get("email") or FOFA_EMAIL
             except Exception as e:
-                log.info(f"  结果页搜索框失败: {e}")
+                log.info(f"解析 user cookie 失败: {e}")
 
-        page_source = driver.page_source
-        log.info(f"页面长度: {len(page_source)}, URL: {driver.current_url}")
-
-        if not loaded:
-            driver.save_screenshot("no_data.png")
-            log.info("所有搜索方式均未加载数据")
+        log.info(f"登录后 Cookies: {list(result['cookies'].keys())}")
+        if result["fofa_token"]:
+            log.info("已拿到 fofa_token")
+        if result["user_key"]:
+            log.info("已拿到 user.key")
 
     except Exception as e:
-        log.error(f"异常: {e}")
+        log.error(f"登录异常: {e}")
         try:
-            driver.save_screenshot("error.png")
+            driver.save_screenshot("login_error.png")
         except:
             pass
-        page_source = ""
     finally:
         try:
             driver.quit()
         except:
             pass
 
-    # ===== 解析 IP =====
-    if "hsxa-ip" in page_source:
-        log.info("从页面提取 IP (BeautifulSoup)...")
-        soup = BeautifulSoup(page_source, "html.parser")
+    return result
+
+
+# ========== 用 requests 构建已登录 session ==========
+def build_fofa_session(auth):
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://fofa.info/",
+    })
+
+    for name, value in auth["cookies"].items():
+        session.cookies.set(name, value, domain=".fofa.info")
+
+    return session
+
+
+# ========== 从 HTML 提取 IP ==========
+def extract_ips_from_html(html):
+    ips = []
+
+    if "hsxa-ip" in html:
+        soup = BeautifulSoup(html, "html.parser")
         for div in soup.find_all("div", class_="hsxa-ip"):
             for a in div.find_all("a", class_="hsxa-jump-a"):
                 if a.get("style") and "display:none" in a.get("style", ""):
@@ -327,19 +283,160 @@ def fofa_search():
                     ips.append(ip_text)
                     break
 
-    if not ips and page_source:
-        log.info("尝试正则提取 IP...")
-        found = re.findall(r'data-clipboard-text="https?://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', page_source)
+    if not ips:
+        found = re.findall(r'data-clipboard-text="https?://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', html)
         if found:
             ips = found
-        else:
-            found = re.findall(r'class="hsxa-jump-a"[^>]*>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})<', page_source)
-            if found:
-                ips = found
 
-    ips = list(dict.fromkeys(ips))
-    log.info(f"提取到 {len(ips)} 个去重IP")
-    return ips
+    if not ips:
+        found = re.findall(r'class="hsxa-jump-a"[^>]*>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})<', html)
+        if found:
+            ips = found
+
+    return list(dict.fromkeys(ips))
+
+
+# ========== 尝试内部 API ==========
+def try_internal_api(auth):
+    token = auth.get("fofa_token")
+    if not token:
+        return []
+
+    qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
+
+    api_candidates = [
+        "https://api.fofa.info/v1/search/all",
+        "https://api.fofa.info/v1/search",
+        "https://api.fofa.info/v1/m/search/all",
+        "https://api.fofa.info/v1/m/search",
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "authorization": token,
+        "Origin": "https://fofa.info",
+        "Referer": "https://fofa.info/",
+    }
+
+    params = {
+        "qbase64": qbase64,
+        "page": "1",
+        "size": "100",
+        "fields": "ip",
+        "ts": str(int(time.time() * 1000)),
+        "lang": "zh-CN",
+    }
+
+    for url in api_candidates:
+        try:
+            log.info(f"尝试内部 API: {url}")
+            resp = requests.get(url, headers=headers, params=params, timeout=20)
+            log.info(f"  状态码: {resp.status_code}")
+
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json()
+            results = data.get("results", [])
+            ips = []
+
+            for row in results:
+                ip = row[0] if isinstance(row, list) else row
+                if isinstance(ip, str) and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                    ips.append(ip)
+
+            ips = list(dict.fromkeys(ips))
+            if ips:
+                log.info(f"内部 API 成功提取 {len(ips)} 个 IP")
+                return ips
+
+        except Exception as e:
+            log.info(f"  内部 API 失败: {e}")
+
+    return []
+
+
+# ========== 尝试官方 API（如果 key 可用）==========
+def try_official_api(auth):
+    user_key = auth.get("user_key")
+    user_email = auth.get("user_email") or FOFA_EMAIL
+    if not user_key:
+        return []
+
+    qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
+    url = "https://fofa.info/api/v1/search/all"
+    params = {
+        "email": user_email,
+        "key": user_key,
+        "qbase64": qbase64,
+        "size": "100",
+        "page": "1",
+        "fields": "ip",
+    }
+
+    try:
+        log.info("尝试官方 API")
+        resp = requests.get(url, params=params, timeout=20)
+        log.info(f"  状态码: {resp.status_code}")
+        if resp.status_code != 200:
+            return []
+
+        data = resp.json()
+        if data.get("error"):
+            log.info(f"  官方 API 错误: {data.get('errmsg', data)}")
+            return []
+
+        results = data.get("results", [])
+        ips = []
+        for row in results:
+            ip = row[0] if isinstance(row, list) else row
+            if isinstance(ip, str) and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                ips.append(ip)
+
+        ips = list(dict.fromkeys(ips))
+        if ips:
+            log.info(f"官方 API 成功提取 {len(ips)} 个 IP")
+        return ips
+
+    except Exception as e:
+        log.info(f"官方 API 失败: {e}")
+        return []
+
+
+# ========== FOFA 搜索 ==========
+def fofa_search():
+    auth = login_and_get_auth()
+
+    session = build_fofa_session(auth)
+    qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
+    search_url = f"https://fofa.info/result?qbase64={qbase64}"
+
+    # 方式1：直接抓 HTML
+    try:
+        log.info(f"请求搜索页 HTML: {search_url}")
+        resp = session.get(search_url, timeout=30)
+        log.info(f"HTML 页面长度: {len(resp.text)}, URL: {resp.url}")
+
+        ips = extract_ips_from_html(resp.text)
+        if ips:
+            log.info(f"从 HTML 提取到 {len(ips)} 个去重IP")
+            return ips
+    except Exception as e:
+        log.info(f"HTML 方式失败: {e}")
+
+    # 方式2：内部 API
+    ips = try_internal_api(auth)
+    if ips:
+        return ips
+
+    # 方式3：官方 API（如果有 key 且额度允许）
+    ips = try_official_api(auth)
+    if ips:
+        return ips
+
+    log.info("所有搜索方式均未提取到 IP")
+    return []
 
 
 # ========== AbuseIPDB ==========
