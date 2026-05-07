@@ -105,21 +105,31 @@ def ocr_captcha(image_bytes):
 
 # ========== Chrome 驱动 ==========
 def create_driver():
+    """
+    创建一个 Chrome（或 Chromium）实例。
+    不再强制指定 version_main，交给 undetected_chromedriver 自动匹配。
+    """
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
 
-    version_main = None
+    # -------------------------------------------------
+    # 仅用于日志输出，方便排查
+    # -------------------------------------------------
     try:
         output = subprocess.check_output(["google-chrome", "--version"]).decode().strip()
-        version_main = int(output.split()[-1].split(".")[0])
-        log.info(f"检测到 Chrome 版本: {version_main}")
-    except Exception as e:
-        log.info(f"无法检测 Chrome 版本: {e}")
+        detected_version = int(output.split()[-1].split(".")[0])
+        log.info(f"检测到本机 Chrome 主版本号: {detected_version}")
+    except Exception:
+        # 可能是 chromium-browser、chromium，或者根本没有 Chrome
+        log.info("未能通过 google-chrome 命令检测 Chrome 版本，交给 undetected_chromedriver 自动处理")
 
-    driver = uc.Chrome(options=options, headless=False, version_main=version_main)
+    # -------------------------------------------------
+    # 关键：不传 version_main，uc 会自行决定使用哪个 driver
+    # -------------------------------------------------
+    driver = uc.Chrome(options=options, headless=False)
     return driver
 
 
