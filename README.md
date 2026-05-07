@@ -44,6 +44,9 @@
 | `CCLOUDFLARE_DNS_NAME` | Cloudflare 托管域名的 DNS 前缀，例如：`us` | `us` |
 | `CLOUDFLARE_DOMAIN` | Cloudflare 托管的主域名 | `example.com` |
 | `FFOFA_COOKIE` | FOFA 的 Cookie | `your_fofa_cookie` |
+| `FOFA_EMAIL` | FOFA 的 Email | `your_fofa_Email` |
+| `FOFA_PASSWORD` | FOFA 的 Password | `your_fofa_Password` |
+Cookie容易失效现在更新为账号密码的形式
 
 ---
 
