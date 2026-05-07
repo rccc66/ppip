@@ -23,7 +23,7 @@
 - Cloudflare API Token
 - Cloudflare Zone ID
 - Cloudflare 域名与子域名前缀
-- FOFA Cookie
+- **~~FOFA Cookie~~**
 
 > **注意：**
 > 变量名请严格按照代码中的名称填写，**不要自行修改变量名**。  
@@ -43,7 +43,7 @@
 | `CLOUDFLARE_ZONE_ID` | Cloudflare 的 Zone ID（区域 ID） | `your_zone_id` |
 | `CCLOUDFLARE_DNS_NAME` | Cloudflare 托管域名的 DNS 前缀，例如：`us` | `us` |
 | `CLOUDFLARE_DOMAIN` | Cloudflare 托管的主域名 | `example.com` |
-| `FFOFA_COOKIE` | FOFA 的 Cookie | `your_fofa_cookie` |
+| `FFOFA_COOKIE` | FOFA 的 Cookie      | ~~`your_fofa_cookie`~~      |
 | `FOFA_EMAIL` | FOFA 的 Email | `your_fofa_Email` |
 | `FOFA_PASSWORD` | FOFA 的 Password | `your_fofa_Password` |
 Cookie容易失效现在更新为账号密码的形式
@@ -60,7 +60,8 @@ CCLOUDFLARE_API_TOKEN=your_cloudflare_api_token
 CLOUDFLARE_ZONE_ID=your_zone_id
 CCLOUDFLARE_DNS_NAME=us
 CLOUDFLARE_DOMAIN=example.com
-FFOFA_COOKIE=your_fofa_cookie
+FOFA_EMAIL=your_fofa_Email
+FOFA_PASSWORD=your_fofa_Password
 ```
 
 ---
