@@ -83,7 +83,9 @@ Settings -> Secrets and variables -> Actions
 - `CLOUDFLARE_ZONE_ID`
 - `CCLOUDFLARE_DNS_NAME`
 - `CLOUDFLARE_DOMAIN`
-- `FFOFA_COOKIE`
+- `FOFA_EMAIL`
+- `FOFA_PASSWORD`
+- ~~FFOFA_COOKIE~~
 
 > 请不要将 API Key、Token 或 Cookie 直接写死在公开代码中。
 
