@@ -106,32 +106,50 @@ def ocr_captcha(image_bytes):
 # ========== Chrome 驱动 ==========
 def create_driver():
     """
-    创建一个 Chrome（或 Chromium）实例。
-    不再强制指定 version_main，交给 undetected_chromedriver 自动匹配。
+    1️⃣ 检测本机 Chrome（或 Chromium）主版本号。
+    2️⃣ 调用 undetected_chromedriver.install() 下载/获取对应版本的 ChromeDriver。
+    3️⃣ 把下载好的 driver 路径显式传给 uc.Chrome，使 Chrome 与 driver 完全匹配。
     """
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    # 如果你真的想无头运行，把下面的 False 改成 True
+    headless_mode = False
+    options.headless = headless_mode
 
-    # -------------------------------------------------
-    # 仅用于日志输出，方便排查
-    # -------------------------------------------------
+    # ---------- 1️⃣ 检测本机 Chrome 主版本 ----------
+    detected_version = None
     try:
-        output = subprocess.check_output(["google-chrome", "--version"]).decode().strip()
-        detected_version = int(output.split()[-1].split(".")[0])
+        out = subprocess.check_output(["google-chrome", "--version"], text=True).strip()
+        # 例子: "Google Chrome 147.0.7727.0"
+        detected_version = int(out.split()[-1].split(".")[0])
         log.info(f"检测到本机 Chrome 主版本号: {detected_version}")
-    except Exception:
-        # 可能是 chromium-browser、chromium，或者根本没有 Chrome
-        log.info("未能通过 google-chrome 命令检测 Chrome 版本，交给 undetected_chromedriver 自动处理")
+    except Exception as e:
+        log.info(f"无法通过 `google-chrome --version` 获取 Chrome 版本: {e}")
 
-    # -------------------------------------------------
-    # 关键：不传 version_main，uc 会自行决定使用哪个 driver
-    # -------------------------------------------------
-    driver = uc.Chrome(options=options, headless=False)
+    # ---------- 2️⃣ 下载或获取匹配的 driver ----------
+    try:
+        if detected_version is not None:
+            # uc.install 会下载与该版本对应的 ChromeDriver（若本地已有则直接返回路径）
+            driver_path = uc.install(browser_version=str(detected_version))
+            log.info(f"已为 Chrome {detected_version} 下载/使用 driver: {driver_path}")
+        else:
+            # 没有系统 Chrome，直接使用 undetected_chromedriver 自带的 Chromium
+            driver_path = uc.install()
+            log.info(f"未检测到系统 Chrome，使用自带 Chromium，driver: {driver_path}")
+    except Exception as e:
+        log.error(f"ChromeDriver 下载/获取失败: {e}")
+        raise
+
+    # ---------- 3️⃣ 创建浏览器实例 ----------
+    driver = uc.Chrome(
+        options=options,
+        driver_executable_path=driver_path,   # 明确指定 driver，避免走旧缓存
+        headless=headless_mode,
+    )
     return driver
-
 
 # ========== FOFA 登录 + 搜索 ==========
 def fofa_search():
