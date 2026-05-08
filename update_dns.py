@@ -83,8 +83,7 @@ def ocr_captcha(image_bytes):
 # ---------- Chrome 驱动（已更新） ----------
 def create_driver():
     """
-    自动下载并使用与当前系统 Chrome（或 Chromium）版本匹配的 ChromeDriver。
-    兼容 undetected_chromedriver >=4.x API（ChromeDriverManager）。
+    自动检测系统 Chrome 版本，并交由 undetected_chromedriver 自动管理驱动。
     """
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
@@ -92,9 +91,8 @@ def create_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     headless_mode = False           # 如需无头请改为 True
-    options.headless = headless_mode
-
-    # 1️⃣ 检测 Chrome 主版本
+    
+    # 1️⃣ 检测本机 Chrome 主版本
     detected_version = None
     try:
         out = subprocess.check_output(["google-chrome", "--version"], text=True).strip()
@@ -103,35 +101,10 @@ def create_driver():
     except Exception as e:
         log.info(f"获取 Chrome 版本失败: {e}")
 
-    # 2️⃣ 下载或获取匹配的 driver
-    try:
-        # 新版 API
-        if detected_version is not None:
-            driver_path = uc.ChromeDriverManager().install(browser_version=str(detected_version))
-            log.info(f"已为 Chrome {detected_version} 下载/使用 driver: {driver_path}")
-        else:
-            driver_path = uc.ChromeDriverManager().install()
-            log.info(f"未检测到系统 Chrome，使用自带 Chromium，driver: {driver_path}")
-    except AttributeError:
-        # 兼容极少数旧版 uc (<4) 的写法
-        try:
-            if detected_version is not None:
-                driver_path = uc.install(browser_version=str(detected_version))
-                log.info(f"[兼容模式] 已为 Chrome {detected_version} 下载/使用 driver: {driver_path}")
-            else:
-                driver_path = uc.install()
-                log.info(f"[兼容模式] 使用默认 driver: {driver_path}")
-        except Exception as e:
-            log.error(f"ChromeDriver 获取失败: {e}")
-            raise
-    except Exception as e:
-        log.error(f"ChromeDriver 下载/获取失败: {e}")
-        raise
-
-    # 3️⃣ 创建浏览器实例
+    # 2️⃣ 直接创建浏览器实例，uc 会自动处理驱动的下载与 Patch
     driver = uc.Chrome(
         options=options,
-        driver_executable_path=driver_path,
+        version_main=detected_version,
         headless=headless_mode,
     )
     return driver
