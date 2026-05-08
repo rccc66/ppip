@@ -26,6 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 log = logging.getLogger(__name__)
 
+# =========================== 环境变量 ===========================
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CF_ZONE_ID = os.getenv("CLOUDFLARE_ZONE_ID")
@@ -35,16 +36,16 @@ CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 FOFA_EMAIL = os.getenv("FOFA_EMAIL")
 FOFA_PASSWORD = os.getenv("FOFA_PASSWORD")
 
-FOFA_QUERY = 'server=="cloudflare" && header="Forbidden" && country=="US" && port="443" && (asn=="31898" || asn=="16509" || asn=="14618" || asn=="8075")'
+FOFA_QUERY = ('server=="cloudflare" && header="Forbidden" && country=="US" && '
+              'port="443" && (asn=="31898" || asn=="16509" || asn=="14618" || asn=="8075")')
 PROXY_CHECK_URL = "https://check.proxyip.cmliussss.net"
 ABUSE_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 ABUSE_THRESHOLD = 20
-
 LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f_login"
 
 
-# ========== 验证码识别 ==========
+# =========================== OCR ===========================
 def preprocess_captcha(image_bytes):
     img = Image.open(BytesIO(image_bytes))
     candidates = []
@@ -97,70 +98,68 @@ def ocr_captcha(image_bytes):
             continue
     if not results:
         return ""
-    counter = Counter(results)
-    best = counter.most_common(1)[0][0]
+    best = Counter(results).most_common(1)[0][0]
     log.info(f"  OCR 候选: {results} -> {best}")
     return best
 
 
-# ========== Chrome 驱动 ==========
+# =========================== Chrome 驱动 ===========================
 def create_driver():
     """
-    1️⃣ 检测本机 Chrome（或 Chromium）主版本号。
-    2️⃣ 调用 undetected_chromedriver.install() 下载/获取对应版本的 ChromeDriver。
-    3️⃣ 把下载好的 driver 路径显式传给 uc.Chrome，使 Chrome 与 driver 完全匹配。
+    自动下载并使用与当前系统 Chrome（或 Chromium）版本匹配的 ChromeDriver。
+    关键点：
+      1️⃣ 检测系统 Chrome 主版本号（若检测不到则交由 uc 自动处理）。
+      2️⃣ 用 uc.install(browser_version=…) 下载/获取对应的 driver。
+      3️⃣ 将 driver 路径显式传给 uc.Chrome，避免使用旧缓存。
     """
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # 如果你真的想无头运行，把下面的 False 改成 True
-    headless_mode = False
+    headless_mode = False           # 如需真正无头请改为 True
     options.headless = headless_mode
 
     # ---------- 1️⃣ 检测本机 Chrome 主版本 ----------
     detected_version = None
     try:
         out = subprocess.check_output(["google-chrome", "--version"], text=True).strip()
-        # 例子: "Google Chrome 147.0.7727.0"
+        # 示例返回: "Google Chrome 147.0.7727.0"
         detected_version = int(out.split()[-1].split(".")[0])
         log.info(f"检测到本机 Chrome 主版本号: {detected_version}")
     except Exception as e:
-        log.info(f"无法通过 `google-chrome --version` 获取 Chrome 版本: {e}")
+        log.info(f"无法通过 google-chrome 获取 Chrome 版本: {e}")
 
-    # ---------- 2️⃣ 下载或获取匹配的 driver ----------
+    # ---------- 2️⃣ 下载或复用匹配的 driver ----------
     try:
         if detected_version is not None:
-            # uc.install 会下载与该版本对应的 ChromeDriver（若本地已有则直接返回路径）
             driver_path = uc.install(browser_version=str(detected_version))
             log.info(f"已为 Chrome {detected_version} 下载/使用 driver: {driver_path}")
         else:
-            # 没有系统 Chrome，直接使用 undetected_chromedriver 自带的 Chromium
             driver_path = uc.install()
             log.info(f"未检测到系统 Chrome，使用自带 Chromium，driver: {driver_path}")
     except Exception as e:
         log.error(f"ChromeDriver 下载/获取失败: {e}")
         raise
 
-    # ---------- 3️⃣ 创建浏览器实例 ----------
+    # ---------- 3️⃣ 创建浏览器 ----------
     driver = uc.Chrome(
         options=options,
-        driver_executable_path=driver_path,   # 明确指定 driver，避免走旧缓存
+        driver_executable_path=driver_path,
         headless=headless_mode,
     )
     return driver
 
-# ========== FOFA 登录 + 搜索 ==========
+
+# =========================== FOFA 登录 + 搜索 ===========================
 def fofa_search():
     driver = create_driver()
     ips = []
 
     try:
-        # ===== 登录 =====
+        # ----- 登录 -----
         for attempt in range(10):
             log.info(f"登录尝试 {attempt + 1}/10 ...")
-
             driver.get(LOGIN_PAGE)
             time.sleep(3)
 
@@ -218,7 +217,8 @@ def fofa_search():
 
             log.info(f"  提交后 URL: {driver.current_url}")
 
-            if "fofa.info" in driver.current_url and "login" not in driver.current_url.replace("f_login", "").lower():
+            if ("fofa.info" in driver.current_url and
+                "login" not in driver.current_url.replace("f_login", "").lower()):
                 log.info("  ✅ 登录成功")
                 break
 
@@ -226,7 +226,7 @@ def fofa_search():
                 log.info("  ❌ 验证码错误或登录失败")
                 time.sleep(1)
 
-        # ===== 确认在 fofa.info =====
+        # ----- 确保在 fofa.info 页面 -----
         if "f_login" in driver.current_url:
             driver.get("https://fofa.info/")
             time.sleep(5)
@@ -237,7 +237,7 @@ def fofa_search():
 
         log.info(f"当前 URL: {driver.current_url}")
 
-        # ===== 搜索方式1: URL 直接跳转 =====
+        # ----- 搜索方式 1：直接构造 URL -----
         qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
         search_url = f"https://fofa.info/result?qbase64={qbase64}"
         log.info(f"访问搜索页: {search_url}")
@@ -253,14 +253,16 @@ def fofa_search():
                 break
             time.sleep(2)
 
-        # ===== 搜索方式2: 搜索框输入 =====
+        # ----- 搜索方式 2：使用搜索框 -----
         if not loaded:
             log.info("  URL 方式未加载数据，尝试搜索框...")
             driver.save_screenshot("url_method_failed.png")
 
             search_selectors = [
-                ('textarea[data-testid="result-search-input"]', 'span[data-testid="result-search-submit"] button'),
-                ('textarea[data-testid="home-search-input"]', 'span[data-testid="home-search-submit"] button'),
+                ('textarea[data-testid="result-search-input"]',
+                 'span[data-testid="result-search-submit"] button'),
+                ('textarea[data-testid="home-search-input"]',
+                 'span[data-testid="home-search-submit"] button'),
             ]
 
             for textarea_sel, btn_sel in search_selectors:
@@ -272,7 +274,8 @@ def fofa_search():
                     search_textarea.click()
                     time.sleep(0.5)
                     driver.execute_script(
-                        "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+                        "arguments[0].value = arguments[1]; "
+                        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
                         search_textarea, FOFA_QUERY
                     )
                     time.sleep(1)
@@ -318,7 +321,7 @@ def fofa_search():
         except:
             pass
 
-    # ===== 解析 IP =====
+    # ----- 解析 IP -----
     if "hsxa-ip" in page_source:
         log.info("从页面提取 IP (BeautifulSoup)...")
         soup = BeautifulSoup(page_source, "html.parser")
@@ -346,7 +349,7 @@ def fofa_search():
     return ips
 
 
-# ========== CF 反代探测 ==========
+# =========================== CF 反代探测 ===========================
 def check_cf_proxy(ip):
     try:
         resp = requests.get(f"https://{ip}/cdn-cgi/trace", verify=False, timeout=5)
@@ -354,7 +357,7 @@ def check_cf_proxy(ip):
             return True
     except:
         pass
-    for scheme in ["http", "https"]:
+    for scheme in ("http", "https"):
         try:
             resp = requests.head(f"{scheme}://{ip}", verify=False, timeout=5)
             if "cloudflare" in resp.headers.get("Server", "").lower():
@@ -364,7 +367,7 @@ def check_cf_proxy(ip):
     return False
 
 
-# ========== AbuseIPDB ==========
+# =========================== AbuseIPDB ===========================
 def abuseipdb_check(ip):
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": 90}
@@ -373,11 +376,12 @@ def abuseipdb_check(ip):
     return resp.json()["data"]["abuseConfidenceScore"]
 
 
-# ========== Cloudflare DNS ==========
+# =========================== Cloudflare DNS ===========================
 def get_dns_records():
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers, params={"type": "A", "name": fqdn}, timeout=15)
+    resp = requests.get(CF_DNS_RECORDS_URL, headers=headers,
+                        params={"type": "A", "name": fqdn}, timeout=15)
     resp.raise_for_status()
     return resp.json().get("result", [])
 
@@ -402,7 +406,7 @@ def delete_dns_record(record_id, ip):
     log.info(f"已删除 DNS 记录: {ip}")
 
 
-# ========== ProxyIP 浏览器检测 ==========
+# =========================== ProxyIP 浏览器检测 ===========================
 def check_proxy_ips():
     log.info("===== 第五步：检测 ProxyIP =====")
     log.info("等待 30 秒让 DNS 生效...")
@@ -435,7 +439,8 @@ def check_proxy_ips():
 
         # 提交
         try:
-            submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"], .check-btn, #checkBtn')
+            submit_btn = driver.find_element(By.CSS_SELECTOR,
+                                             'button[type="submit"], .check-btn, #checkBtn')
             submit_btn.click()
             log.info("  点击提交按钮")
         except:
@@ -450,25 +455,22 @@ def check_proxy_ips():
         for wait_round in range(90):
             time.sleep(2)
             page_source = driver.page_source
-            current_count = page_source.count("result-item")
-
-            if current_count > 0:
-                if current_count == last_count:
+            cur = page_source.count("result-item")
+            if cur > 0:
+                if cur == last_count:
                     stable_rounds += 1
                 else:
                     stable_rounds = 0
-                    last_count = current_count
-                    log.info(f"  已加载 {current_count} 个结果...")
-
-                # 结果数量稳定 5 轮（10秒没变化）认为加载完成
-                if stable_rounds >= 5:
-                    log.info(f"  结果加载完成，共 {current_count} 个")
+                    last_count = cur
+                    log.info(f"  已加载 {cur} 个结果...")
+                if stable_rounds >= 5:      # 5 次（10 s）不变认为加载完成
+                    log.info(f"  结果加载完成，共 {cur} 个")
                     break
 
         time.sleep(3)
         page_source = driver.page_source
 
-        # 提取结果
+        # 解析结果
         soup = BeautifulSoup(page_source, "html.parser")
         result_items = soup.find_all("div", class_="result-item")
         log.info(f"  找到 {len(result_items)} 个检测结果")
@@ -500,26 +502,22 @@ def check_proxy_ips():
         except:
             pass
 
-    # 构建状态
+    # 构建返回结构
     ip_status = {}
     for ip in all_ips:
-        if ip in valid_ips:
-            ip_status[ip] = "valid"
-        else:
-            ip_status[ip] = "invalid"
+        ip_status[ip] = "valid" if ip in valid_ips else "invalid"
 
     log.info(f"  有效: {len(valid_ips)}, 无效: {len(all_ips) - len(valid_ips)}")
     return ip_status
 
 
-# ========== CloudflareST 真下载测速（新增）==========
+# =========================== CloudflareST 真下载测速 ===========================
 def run_cloudflare_speedtest(valid_ips):
     if not valid_ips:
         log.info("没有有效 IP 可供 CloudflareST 测速")
         return []
 
     log.info("===== 第七步：CloudflareST 真实下载测速 =====")
-
     ip_file = "cf_ips.txt"
     result_file = "cf_speedtest.csv"
 
@@ -567,64 +565,46 @@ def run_cloudflare_speedtest(valid_ips):
         return []
 
     speed_results = []
-
     if os.path.exists(result_file):
         try:
             with open(result_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-
             for line in lines[1:]:
                 line = line.strip()
                 if not line:
                     continue
-
                 parts = [x.strip() for x in line.split(",")]
                 if len(parts) >= 6:
                     ip = parts[0]
-                    sent = parts[1] if len(parts) > 1 else ""
-                    recv = parts[2] if len(parts) > 2 else ""
-                    loss = parts[3] if len(parts) > 3 else ""
-                    latency = parts[4] if len(parts) > 4 else ""
-                    speed = parts[5] if len(parts) > 5 else ""
-                    region = parts[6] if len(parts) > 6 else ""
-
                     try:
-                        speed_float = float(speed)
+                        speed_float = float(parts[5])
                     except:
                         speed_float = 0.0
-
                     speed_results.append({
                         "ip": ip,
-                        "sent": sent,
-                        "recv": recv,
-                        "loss": loss,
-                        "latency": latency,
+                        "sent": parts[1] if len(parts) > 1 else "",
+                        "recv": parts[2] if len(parts) > 2 else "",
+                        "loss": parts[3] if len(parts) > 3 else "",
+                        "latency": parts[4] if len(parts) > 4 else "",
                         "speed_mbps": speed_float,
-                        "region": region
+                        "region": parts[6] if len(parts) > 6 else "",
                     })
-
             if speed_results:
                 log.info("===== CloudflareST 下载速度排名（越大越好） =====")
                 speed_results.sort(key=lambda x: x["speed_mbps"], reverse=True)
                 for idx, item in enumerate(speed_results, 1):
-                    log.info(
-                        f"  #{idx} {item['ip']} -> "
-                        f"{item['speed_mbps']:.2f} MB/s, "
-                        f"延迟 {item['latency']}, "
-                        f"丢包 {item['loss']}, "
-                        f"地区 {item['region']}"
-                    )
+                    log.info(f"  #{idx} {item['ip']} -> {item['speed_mbps']:.2f} MB/s, "
+                             f"延迟 {item['latency']}, 丢包 {item['loss']}, 区域 {item['region']}")
             else:
                 log.info("cf_speedtest.csv 存在，但没有解析到测速结果")
         except Exception as e:
             log.info(f"解析 CloudflareST 结果失败: {e}")
     else:
         log.info("未生成 cf_speedtest.csv，可能测速未成功")
-
     return speed_results
 
 
-# ========== 清理 ==========
+# =========================== 清理 ===========================
 def cleanup_failed_ips(ip_status):
     log.info("===== 第六步：清理失败 IP =====")
     failed_ips = [ip for ip, s in ip_status.items() if s == "invalid"]
@@ -641,7 +621,7 @@ def cleanup_failed_ips(ip_status):
                 log.info(f"❌ 删除失败 {r['content']}: {e}")
 
 
-# ========== 主流程 ==========
+# =========================== 主流程 ===========================
 def main():
     log.info("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
