@@ -107,17 +107,15 @@ def ocr_captcha(image_bytes):
 def create_driver():
     """
     自动下载并使用与当前系统 Chrome（或 Chromium）版本匹配的 ChromeDriver。
-    关键点：
-      1️⃣ 检测系统 Chrome 主版本号（若检测不到则交由 uc 自动处理）。
-      2️⃣ 用 uc.install(browser_version=…) 下载/获取对应的 driver。
-      3️⃣ 将 driver 路径显式传给 uc.Chrome，避免使用旧缓存。
+    兼容最新的 undetected_chromedriver（>=4.x） API。
     """
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    headless_mode = False           # 如需真正无头请改为 True
+    # 如果你想真正无头运行，请把下面的 False 改成 True
+    headless_mode = False
     options.headless = headless_mode
 
     # ---------- 1️⃣ 检测本机 Chrome 主版本 ----------
@@ -128,28 +126,28 @@ def create_driver():
         detected_version = int(out.split()[-1].split(".")[0])
         log.info(f"检测到本机 Chrome 主版本号: {detected_version}")
     except Exception as e:
-        log.info(f"无法通过 google-chrome 获取 Chrome 版本: {e}")
+        log.info(f"无法获取系统 Chrome 版本: {e}")
 
-    # ---------- 2️⃣ 下载或复用匹配的 driver ----------
+    # ---------- 2️⃣ 下载或获取匹配的 driver ----------
     try:
+        # 使用新版的 ChromeDriverManager
         if detected_version is not None:
-            driver_path = uc.install(browser_version=str(detected_version))
+            driver_path = uc.ChromeDriverManager().install(browser_version=str(detected_version))
             log.info(f"已为 Chrome {detected_version} 下载/使用 driver: {driver_path}")
         else:
-            driver_path = uc.install()
+            driver_path = uc.ChromeDriverManager().install()
             log.info(f"未检测到系统 Chrome，使用自带 Chromium，driver: {driver_path}")
     except Exception as e:
-        log.error(f"ChromeDriver 下载/获取失败: {e}")
+        log.error(f"ChromeDriver 获取/下载失败: {e}")
         raise
 
-    # ---------- 3️⃣ 创建浏览器 ----------
+    # ---------- 3️⃣ 创建浏览器实例 ----------
     driver = uc.Chrome(
         options=options,
         driver_executable_path=driver_path,
         headless=headless_mode,
     )
     return driver
-
 
 # =========================== FOFA 登录 + 搜索 ===========================
 def fofa_search():
