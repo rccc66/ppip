@@ -68,6 +68,11 @@ def create_driver():
     options.add_argument("--start-maximized")
     # 真实 UA（避免 uc 默认 UA 被 CF 识别）
     options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+    # 启用 console 日志抓取（用于诊断 Turnstile 错误）
+    options.add_argument("--enable-logging")
+    options.add_argument("--log-level=0")
+    options.add_argument("--v=0")
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL", "driver": "ALL"})
 
     # 关键：代理设置（仿照 Hohai 脚本 v6 策略）
     if os.getenv("GITHUB_ACTIONS") or os.getenv("FORCE_PROXY"):
@@ -104,6 +109,19 @@ def create_driver():
         headless=headless_mode,
     )
     driver.implicitly_wait(5)
+
+    # 启用 console log 抓取（用于诊断 Turnstile 错误）
+    try:
+        driver.execute_cdp_cmd(
+            "Browser.grantPermissions",
+            {"permissions": ["notifications"]},
+        )
+    except Exception:
+        pass
+    try:
+        driver.set_log_level("INFO")  # 不一定都支持
+    except Exception:
+        pass
 
     # 启动后验证代理是否真的工作
     if os.getenv("GITHUB_ACTIONS") or os.getenv("FORCE_PROXY"):
@@ -485,6 +503,82 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
 
     state = _get_widget_state()
     log.info(f"  widget 初始状态: {state}")
+
+    # 4.5) 关键诊断：如果初始状态就是无 iframe 无 token，立刻保存截图+HTML+JS console
+    if (state.get("cfIframeCount", 0) == 0
+            and state.get("widgetIframeCount", 0) == 0
+            and not state.get("tokenValue")):
+        log.info("  ⚠️  初始就无 iframe 无 token, 保存诊断现场...")
+        _save_debug(driver, "initial_no_widget")
+
+        # 额外打印页面上所有 iframe 的完整信息（用 JS）
+        try:
+            all_iframes_info = driver.execute_script("""
+                var iframes = document.querySelectorAll('iframe');
+                var info = [];
+                for (var i = 0; i < iframes.length; i++) {
+                    var f = iframes[i];
+                    info.push({
+                        index: i,
+                        id: f.id || '',
+                        name: f.name || '',
+                        src: (f.src || '').substring(0, 200),
+                        width: f.offsetWidth,
+                        height: f.offsetHeight,
+                        visible: f.offsetWidth > 0 && f.offsetHeight > 0,
+                        parentId: f.parentElement ? f.parentElement.id : '',
+                        parentClass: f.parentElement ? f.parentElement.className : ''
+                    });
+                }
+                return info;
+            """)
+            log.info(f"  📋 页面所有 iframe 详情: {all_iframes_info}")
+        except Exception as e:
+            log.info(f"  获取 iframe 详情失败: {e}")
+
+        # 检查 navigator.webdriver 等关键指纹
+        try:
+            fingerprint = driver.execute_script("""
+                return {
+                    webdriver: navigator.webdriver,
+                    userAgent: navigator.userAgent,
+                    platform: navigator.platform,
+                    languages: navigator.languages,
+                    cookieEnabled: navigator.cookieEnabled,
+                    hardwareConcurrency: navigator.hardwareConcurrency,
+                    deviceMemory: navigator.deviceMemory,
+                    maxTouchPoints: navigator.maxTouchPoints,
+                    vendor: navigator.vendor,
+                    hasCDP: typeof window.cdc_adoQpoasnfa76pfcZLmcfl_Array !== 'undefined'
+                         || typeof window.cdc_adoQpoasnfa76pfcZLmcfl_Promise !== 'undefined'
+                         || typeof window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol !== 'undefined',
+                    turnstileExists: typeof window.turnstile !== 'undefined',
+                    turnstileRenderExists: !!(window.turnstile && window.turnstile.render),
+                    turnstileResetExists: !!(window.turnstile && window.turnstile.reset),
+                    turnstileGetResponseExists: !!(window.turnstile && window.turnstile.getResponse),
+                    widgetInnerHTML: (document.querySelector('div.cf-turnstile') || {}).innerHTML || '',
+                    documentTitle: document.title,
+                    documentReadyState: document.readyState
+                };
+            """)
+            log.info(f"  🔍 浏览器指纹 & Turnstile API 状态:")
+            for k, v in fingerprint.items():
+                if k == 'widgetInnerHTML':
+                    log.info(f"     {k}: {str(v)[:200]}")
+                else:
+                    log.info(f"     {k}: {v}")
+        except Exception as e:
+            log.info(f"  获取指纹失败: {e}")
+
+        # 检查浏览器 console 日志
+        try:
+            logs = driver.get_log("browser")
+            if logs:
+                log.info(f"  📜 浏览器 console 日志 (最近 20 条):")
+                for entry in logs[-20:]:
+                    log.info(f"     [{entry.get('level', '?')}] {entry.get('message', '')[:200]}")
+        except Exception:
+            pass
 
     # 5) 如果 iframe 已存在但 token 还没生成，**不要 reset**（reset 会破坏已渲染的 iframe）
     #    只在确实没有 iframe 且没有 token 时才尝试强制重新 render
