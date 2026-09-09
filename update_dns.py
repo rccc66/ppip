@@ -29,6 +29,10 @@ CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 FOFA_EMAIL = os.getenv("FOFA_EMAIL")
 FOFA_PASSWORD = os.getenv("FOFA_PASSWORD")
+# FOFA API：强烈推荐配置，绕过 Turnstile 浏览器登录
+FOFA_API_KEY = os.getenv("FOFA_API_KEY", "")
+# FOFA API 用的 qbase64 是 base64 编码后的查询，size 限制 100-10000
+FOFA_API_SIZE = int(os.getenv("FOFA_API_SIZE", "100"))
 # 可选：如果 Turnstile 自动通过失败，用 2captcha 兜底
 TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
 FOFA_QUERY = ('server=="cloudflare" && header="Forbidden" && country=="US" && '
@@ -233,31 +237,43 @@ def _click_turnstile_checkbox(driver, log):
                 "no_iframe", "click_error"}
     """
     # 1) 扫描所有 iframe，找 Cloudflare Turnstile 的那个
+    # FOFA 的 iframe 在 widget 外层，且 id 形如 cf-chl-widget-XXX
     target_iframe = None
     try:
         all_iframes = driver.find_elements(By.TAG_NAME, "iframe")
         log.info(f"  页面 iframe 总数: {len(all_iframes)}")
-
-        # 第一轮：找可见且 src 含 cloudflare 的
-        for f in all_iframes:
+        for i, f in enumerate(all_iframes):
             try:
-                src = f.get_attribute("src") or ""
-                if not src:
+                src = (f.get_attribute("src") or "").lower()
+                fid = f.get_attribute("id") or ""
+                if not src and not fid:
                     continue
-                if "cloudflare" in src or "turnstile" in src or "challenges" in src:
+                # 三种识别条件（任一命中即视为 CF iframe）
+                is_cf = (
+                    "cloudflare" in src
+                    or "challenges" in src
+                    or "turnstile" in src
+                    or fid.startswith("cf-chl-widget")
+                )
+                if is_cf:
                     target_iframe = f
                     try:
                         displayed = f.is_displayed()
+                        size = f.size
                     except Exception:
                         displayed = True
-                    log.info(f"  锁定 CF iframe, src={src[:80]}, displayed={displayed}")
+                        size = {}
+                    log.info(f"  锁定 CF iframe #{i}: id={fid}, "
+                             f"src={src[:80]}, displayed={displayed}, "
+                             f"size={size.get('width', '?')}x{size.get('height', '?')}")
                     break
             except StaleElementReferenceException:
                 continue
-            except Exception:
+            except Exception as e:
+                log.info(f"  扫描 iframe #{i} 异常: {type(e).__name__}: {str(e)[:100]}")
                 continue
 
-        # 第二轮兜底：.cf-turnstile 容器内的任意 iframe（不管 src）
+        # 兜底：.cf-turnstile 容器内的任意 iframe
         if target_iframe is None:
             try:
                 container = driver.find_element(By.CSS_SELECTOR, "div.cf-turnstile")
@@ -400,30 +416,58 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
         pass
     log.info(f"  Turnstile sitekey={sitekey}, page={page_url}")
 
-    # 4) 检查 widget 当前状态
+    # 4) 检查 widget 当前状态（全文档扫描 iframe）
     def _get_widget_state():
         try:
             return driver.execute_script("""
                 var widget = document.querySelector('div.cf-turnstile');
                 if (!widget) return {found: false};
-                var iframes = widget.querySelectorAll('iframe');
-                var inputs = widget.querySelectorAll('input[name="cf-turnstile-response"]');
-                var inputValue = inputs.length > 0 ? inputs[0].value : '';
+
+                // 全文档扫描 CF iframe（FOFA 的 iframe 不一定在 widget 内）
                 var allIframes = document.querySelectorAll('iframe');
                 var cfIframes = [];
-                allIframes.forEach(function(f) {
-                    var src = f.src || '';
-                    if (src.indexOf('cloudflare') >= 0 || src.indexOf('challenges') >= 0) {
-                        cfIframes.push(src.substring(0, 80));
+                var cfIframeIds = [];
+                var cfIframeVisible = [];
+                for (var i = 0; i < allIframes.length; i++) {
+                    var f = allIframes[i];
+                    var src = (f.src || '').toLowerCase();
+                    var id = f.id || '';
+                    if (src.indexOf('cloudflare') >= 0
+                        || src.indexOf('challenges') >= 0
+                        || src.indexOf('turnstile') >= 0
+                        || id.indexOf('cf-chl-widget') === 0) {
+                        cfIframes.push(src.substring(0, 100));
+                        cfIframeIds.push(id);
+                        try {
+                            cfIframeVisible.push(f.offsetWidth > 0 && f.offsetHeight > 0);
+                        } catch(e) {
+                            cfIframeVisible.push(true);
+                        }
                     }
-                });
+                }
+
+                // 也扫描 widget 内部
+                var widgetIframes = widget.querySelectorAll('iframe');
+
+                // token input 可能在 widget 内，也可能在 form 里
+                var inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                var inputValue = inputs.length > 0 ? (inputs[0].value || '') : '';
+
+                // 提交按钮状态
+                var btn = document.querySelector('button[type="submit"]');
+                var btnDisabled = btn ? btn.disabled : true;
+
                 return {
                     found: true,
-                    iframeCount: iframes.length,
+                    widgetIframeCount: widgetIframes.length,
+                    cfIframeCount: cfIframes.length,
                     cfIframeSrcs: cfIframes,
+                    cfIframeIds: cfIframeIds,
+                    cfIframeVisible: cfIframeVisible,
                     totalIframes: allIframes.length,
                     tokenValue: inputValue,
-                    tokenLength: inputValue.length
+                    tokenLength: inputValue.length,
+                    btnDisabled: btnDisabled
                 };
             """)
         except Exception as e:
@@ -433,20 +477,27 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
     state = _get_widget_state()
     log.info(f"  widget 初始状态: {state}")
 
-    # 5) 主动调 turnstile.reset() / render() 强制重启
-    if state.get("found") and state.get("iframeCount", 0) == 0 and not state.get("tokenValue"):
-        log.info("  widget 内无 iframe 且无 token, 主动调 turnstile.reset()...")
+    # 5) 如果 iframe 已存在但 token 还没生成，**不要 reset**（reset 会破坏已渲染的 iframe）
+    #    只在确实没有 iframe 且没有 token 时才尝试 reset
+    if (state.get("cfIframeCount", 0) == 0
+            and state.get("widgetIframeCount", 0) == 0
+            and not state.get("tokenValue")):
+        log.info("  全文档无 CF iframe 且无 token, 主动调 turnstile.reset()...")
         reset_result = driver.execute_script("""
             try {
                 var widget = document.querySelector('div.cf-turnstile');
                 if (!widget) return 'no_widget';
                 if (!window.turnstile) return 'no_turnstile_api';
 
-                // 找 widget ID (从 input id 提取: cf-chl-widget-XXX_response -> cf-chl-widget-XXX)
-                var inputs = widget.querySelectorAll('input[id^="cf-chl-widget-"]');
+                // 找 widget ID
+                var inputs = document.querySelectorAll('input[id^="cf-chl-widget-"]');
                 var widgetId = null;
                 if (inputs.length > 0) {
                     widgetId = inputs[0].id.replace('_response', '');
+                }
+                if (!widgetId) {
+                    // 从 widget 自身找 data-turnstile-id 或直接拿 sitekey 重 render
+                    widgetId = widget.getAttribute('data-turnstile-id');
                 }
 
                 if (widgetId && window.turnstile.reset) {
@@ -454,11 +505,11 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
                         window.turnstile.reset(widgetId);
                         return 'reset_ok: ' + widgetId;
                     } catch(e1) {
-                        // reset 失败, 走 render 流程
+                        return 'reset_error: ' + e1.message;
                     }
                 }
 
-                // fallback: 移除原 widget 内容, 重新 render
+                // fallback: 重新 render
                 widget.innerHTML = '';
                 var sitekey = widget.getAttribute('data-sitekey');
                 var action = widget.getAttribute('data-action');
@@ -496,18 +547,23 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
             }
         """)
         log.info(f"  reset/render 结果: {reset_result}")
-        time.sleep(3)
 
-        # 再查一次状态
-        state = _get_widget_state()
+        # reset 后给 Turnstile 充足时间重新加载 iframe（最多 15s）
+        log.info("  等待 CF iframe 重新加载 (最多 15s)...")
+        for _ in range(15):
+            time.sleep(1)
+            state = _get_widget_state()
+            if state.get("cfIframeCount", 0) > 0 or state.get("tokenValue"):
+                log.info(f"  iframe 已出现 / token 已生成")
+                break
         log.info(f"  reset 后 widget 状态: {state}")
 
-    # 6) 主策略：监听 token input value + 按钮启用，最多 auto_timeout 秒
+    # 6) 主策略：监听 token + 按钮，最多 auto_timeout 秒
     log.info(f"  等待 Turnstile 自动通过 (最多 {auto_timeout}s)...")
     deadline = time.time() + auto_timeout
     last_log_time = time.time()
     while time.time() < deadline:
-        # 检查 token 是否已生成
+        # 检查 token
         try:
             token = driver.execute_script(
                 "var i = document.querySelector('input[name=\"cf-turnstile-response\"]');"
@@ -518,7 +574,6 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
 
         if token and len(token) > 10:
             log.info(f"  ✅ Turnstile token 已生成 (长度 {len(token)})")
-            # 启用提交按钮
             try:
                 btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
                 driver.execute_script("arguments[0].disabled = false;", btn)
@@ -527,30 +582,30 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
                 pass
             return True
 
-        # 检查按钮是否已启用（onTurnstileSuccess 触发）
         if _submit_button_enabled(driver):
             log.info("  ✅ 提交按钮已启用 (onTurnstileSuccess 已触发)")
             return True
 
-        # 每 10s 打印一次状态，方便诊断
-        if time.time() - last_log_time > 10:
+        # 每 5s 打印一次状态
+        if time.time() - last_log_time > 5:
             cur_state = _get_widget_state()
             elapsed = int(time.time() - (deadline - auto_timeout))
-            log.info(f"  [{elapsed}s] 等待中... token_len={cur_state.get('tokenLength', 0)}, "
-                     f"iframe={cur_state.get('iframeCount', 0)}, "
-                     f"total_iframes={cur_state.get('totalIframes', 0)}")
+            log.info(f"  [{elapsed}s] token_len={cur_state.get('tokenLength', 0)}, "
+                     f"cf_iframe={cur_state.get('cfIframeCount', 0)}, "
+                     f"total_iframes={cur_state.get('totalIframes', 0)}, "
+                     f"btn_disabled={cur_state.get('btnDisabled', True)}")
             last_log_time = time.time()
 
-        time.sleep(2)
+        time.sleep(1)
 
     log.info(f"  Turnstile 自动通过超时 ({auto_timeout}s)")
 
-    # 7) 兜底 A：ActionChains 点击 iframe
+    # 7) 兜底 A：ActionChains 点击 CF iframe
     state = _get_widget_state()
-    if state.get("iframeCount", 0) > 0 or state.get("totalIframes", 0) > 0:
-        log.info("  尝试 ActionChains 物理点击...")
+    if state.get("cfIframeCount", 0) > 0 or state.get("totalIframes", 0) > 0:
+        log.info("  尝试 ActionChains 物理点击 CF iframe...")
         for attempt in range(1, max_click_retries + 1):
-            log.info(f"  尝试点击 Turnstile checkbox (第 {attempt}/{max_click_retries} 次)...")
+            log.info(f"  尝试点击 Turnstile (第 {attempt}/{max_click_retries} 次)...")
             clicked, status = _click_turnstile_checkbox(driver, log)
 
             if status == "success":
@@ -602,8 +657,62 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
     return False
 
 
-# ---------- FOFA 搜索 ----------
-def fofa_search():
+# ---------- FOFA API（推荐路径，绕过 Turnstile） ----------
+def fofa_search_via_api():
+    """
+    通过 FOFA API 直接搜索，无需浏览器、无需解 Turnstile。
+    FOFA API 文档：https://fofa.info/api/api_pages
+    接口：/api/v1/search/all
+    """
+    if not FOFA_API_KEY:
+        log.info("未配置 FOFA_API_KEY，跳过 API 模式")
+        return []
+
+    log.info("===== 使用 FOFA API 搜索 IP =====")
+    qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
+    url = "https://fofa.info/api/v1/search/all"
+    params = {
+        "email": FOFA_EMAIL,
+        "key": FOFA_API_KEY,
+        "qbase64": qbase64,
+        "size": FOFA_API_SIZE,
+        "fields": "ip,port,server,country,as_organization",
+    }
+    log.info(f"API 请求: {url} (qbase64 长度={len(qbase64)}, size={FOFA_API_SIZE})")
+
+    try:
+        resp = requests.get(url, params=params, timeout=30, verify=True)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.error(f"❌ FOFA API 请求异常: {type(e).__name__}: {str(e)[:300]}")
+        return []
+
+    if data.get("error"):
+        log.error(f"❌ FOFA API 返回错误: {data.get('errmsg', data.get('error'))}")
+        return []
+
+    results = data.get("results", [])
+    log.info(f"✅ FOFA API 返回 {len(results)} 条结果")
+
+    ips = []
+    for item in results:
+        if isinstance(item, dict):
+            ip = item.get("ip") or item.get("host") or ""
+        else:
+            # 旧版 API 返回列表形式 [ip, port, ...]
+            ip = item[0] if item else ""
+        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', str(ip)):
+            ips.append(str(ip))
+
+    ips = list(dict.fromkeys(ips))
+    log.info(f"提取到 {len(ips)} 个去重 IP")
+    return ips
+
+
+# ---------- FOFA 搜索（浏览器版，作为 fallback） ----------
+def fofa_search_via_browser():
+    """原浏览器自动化流程，作为 API 不可用时的 fallback。"""
     driver = create_driver()
     ips = []
 
@@ -611,6 +720,12 @@ def fofa_search():
         # ===== 登录（最多 3 次） =====
         for attempt in range(3):
             log.info(f"登录尝试 {attempt + 1}/3 ...")
+            # 重置 page_load_timeout（_verify_proxy_working 设成了 20s，这里放宽）
+            try:
+                driver.set_page_load_timeout(60)
+            except Exception:
+                pass
+
             driver.get(LOGIN_PAGE)
 
             # 等 document.readyState=complete
@@ -621,7 +736,26 @@ def fofa_search():
             except TimeoutException:
                 log.info("  页面 readyState 超时，继续")
 
-            time.sleep(2)  # 给 Turnstile api.js 一点启动时间
+            # 等 Turnstile api.js 加载（关键！readyState=complete 不代表 api.js 已加载）
+            log.info("  等 Turnstile api.js 加载...")
+            api_js_ready = False
+            for _ in range(15):
+                try:
+                    if driver.execute_script(
+                        "return typeof window.turnstile !== 'undefined' && window.turnstile !== null;"
+                    ):
+                        api_js_ready = True
+                        log.info("  ✅ Turnstile api.js 已加载")
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            if not api_js_ready:
+                log.info("  ❌ Turnstile api.js 加载失败")
+                _save_debug(driver, "no_turnstile_api")
+
+            # 再等 2-3s 让 api.js 完成 widget render
+            time.sleep(3)
 
             if "fofa.info" in driver.current_url and "login" not in driver.current_url.lower():
                 log.info("  ✅ 已登录")
@@ -644,7 +778,8 @@ def fofa_search():
                 continue
 
             # 处理 Cloudflare Turnstile（替代原图片验证码）
-            if not handle_turnstile(driver, log, auto_timeout=25):
+            # auto_timeout=45 给充足时间让 iframe 加载完 + 自动通过
+            if not handle_turnstile(driver, log, auto_timeout=45):
                 time.sleep(1)
                 continue
 
@@ -799,6 +934,26 @@ def fofa_search():
     ips = list(dict.fromkeys(ips))
     log.info(f"提取到 {len(ips)} 个去重IP")
     return ips
+
+
+# ---------- FOFA 搜索（调度入口：API 优先，浏览器兜底） ----------
+def fofa_search():
+    """
+    调度入口：
+      1. 配置了 FOFA_API_KEY → 直接走 API（推荐，绕过 Turnstile）
+      2. API 不可用 / 失败 → 回退到浏览器自动化
+    """
+    if FOFA_API_KEY:
+        log.info("检测到 FOFA_API_KEY, 优先使用 FOFA API")
+        ips = fofa_search_via_api()
+        if ips:
+            return ips
+        log.warning("⚠️ FOFA API 未返回 IP, 回退到浏览器自动化模式")
+
+    # 浏览器 fallback
+    log.info("===== 使用浏览器模式搜索 IP =====")
+    return fofa_search_via_browser()
+
 
 def check_cf_proxy(ip):
     try:
