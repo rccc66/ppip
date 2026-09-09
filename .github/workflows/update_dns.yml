@@ -224,15 +224,24 @@ jobs:
             exit 1
           fi
 
+      - name: List Debug Files
+        if: failure()
+        run: |
+          echo "=== 当前目录文件 ==="
+          ls -la
+          echo "=== debug/ 目录文件 ==="
+          ls -la debug/ 2>/dev/null || echo "无 debug 目录"
+
       - name: Upload Debug Artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-${{ github.run_id }}
           path: |
+            debug/
             *.png
             *.html
             *.txt
             *.log
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 7
