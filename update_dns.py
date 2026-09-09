@@ -237,30 +237,34 @@ def _click_turnstile_checkbox(driver, log):
     try:
         all_iframes = driver.find_elements(By.TAG_NAME, "iframe")
         log.info(f"  页面 iframe 总数: {len(all_iframes)}")
+
+        # 第一轮：找可见且 src 含 cloudflare 的
         for f in all_iframes:
             try:
-                if not f.is_displayed():
-                    continue
                 src = f.get_attribute("src") or ""
-                if ("cloudflare" in src or "turnstile" in src or "challenges" in src):
+                if not src:
+                    continue
+                if "cloudflare" in src or "turnstile" in src or "challenges" in src:
                     target_iframe = f
-                    log.info(f"  锁定 CF iframe, src={src[:100]}")
+                    try:
+                        displayed = f.is_displayed()
+                    except Exception:
+                        displayed = True
+                    log.info(f"  锁定 CF iframe, src={src[:80]}, displayed={displayed}")
                     break
             except StaleElementReferenceException:
                 continue
             except Exception:
                 continue
 
-        # 兜底：在 .cf-turnstile 容器内找
+        # 第二轮兜底：.cf-turnstile 容器内的任意 iframe（不管 src）
         if target_iframe is None:
             try:
                 container = driver.find_element(By.CSS_SELECTOR, "div.cf-turnstile")
                 inner_iframes = container.find_elements(By.TAG_NAME, "iframe")
-                for f in inner_iframes:
-                    if f.is_displayed():
-                        target_iframe = f
-                        log.info("  在 .cf-turnstile 容器内找到 iframe")
-                        break
+                if inner_iframes:
+                    target_iframe = inner_iframes[0]
+                    log.info(f"  在 .cf-turnstile 容器内找到 iframe ({len(inner_iframes)} 个)")
             except Exception:
                 pass
     except Exception as e:
@@ -348,20 +352,44 @@ def handle_turnstile(driver, log, auto_timeout=25, max_click_retries=3):
     """
     FOFA 登录页使用 Cloudflare Turnstile 替代图片验证码。
     策略：
-      1) 主：等 Turnstile managed 模式自动通过（uc + 真实指纹下常自动放行）
-      2) 兜底 A：手动点击 Turnstile iframe 内 checkbox，最多重试 max_click_retries 次
-      3) 兜底 B：2captcha 外部打码（需配置 TWOCAPTCHA_API_KEY）
+      1) 等 Turnstile widget 渲染完成（div.cf-turnstile 出现 + iframe 注入完成）
+      2) 主：等 Turnstile managed 模式自动通过（uc + 真实指纹下常自动放行）
+      3) 兜底 A：手动 ActionChains 物理点击 Turnstile iframe，最多重试 max_click_retries 次
+      4) 兜底 B：2captcha 外部打码（需配置 TWOCAPTCHA_API_KEY）
     成功返回 True，失败返回 False。
     """
-    # 1) 等待 Turnstile 组件渲染
+    # 1) 等待 Turnstile 容器 div 出现
     try:
-        WebDriverWait(driver, 10).until(
+        WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.cf-turnstile"))
         )
     except TimeoutException:
-        log.info("  未找到 Turnstile 组件，可能页面结构已变或已登录")
-        _save_debug(driver, "no_turnstile")
+        log.info("  未找到 Turnstile 容器 div.cf-turnstile")
+        _save_debug(driver, "no_turnstile_div")
         return False
+
+    # 2) 关键：等 Turnstile api.js 把 iframe 注入到 .cf-turnstile 内部
+    # 这是上次失败的根本原因——只等 div 出现，但 iframe 还没异步渲染好
+    log.info("  等待 Turnstile iframe 注入完成 (最多 20s)...")
+    try:
+        WebDriverWait(driver, 20).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.cf-turnstile iframe")) > 0
+            or len(d.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")) > 0
+        )
+        log.info("  ✅ Turnstile iframe 已注入")
+    except TimeoutException:
+        # iframe 没出现但可能 Turnstile 已自动通过（managed 模式下有时会跳过 widget）
+        log.info("  Turnstile iframe 未注入，检查是否已自动通过")
+        try:
+            # 直接看提交按钮是否已启用
+            btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+            if btn.is_enabled() and not btn.get_attribute("disabled"):
+                log.info("  ✅ 提交按钮已启用，Turnstile 自动通过")
+                return True
+        except Exception:
+            pass
+        _save_debug(driver, "no_iframe_injected")
+        # 不直接 return，让后续逻辑兜底
 
     # 取 sitekey 和 page_url，给兜底 B 用
     sitekey = None
@@ -373,7 +401,7 @@ def handle_turnstile(driver, log, auto_timeout=25, max_click_retries=3):
         pass
     log.info(f"  Turnstile sitekey={sitekey}, page={page_url}")
 
-    # 2) 主策略：等提交按钮自动启用
+    # 3) 主策略：等提交按钮自动启用
     log.info(f"  等待 Turnstile 自动通过 (最多 {auto_timeout}s)...")
     try:
         WebDriverWait(driver, auto_timeout).until(_submit_button_enabled)
@@ -382,8 +410,21 @@ def handle_turnstile(driver, log, auto_timeout=25, max_click_retries=3):
     except TimeoutException:
         log.info("  Turnstile 未自动通过，转为点击 checkbox")
 
-    # 3) 兜底 A：点击 checkbox，最多重试 max_click_retries 次
+    # 4) 兜底 A：点击 checkbox，最多重试 max_click_retries 次
     for attempt in range(1, max_click_retries + 1):
+        # 每次重试前再等一下 iframe（之前可能没渲染好）
+        if attempt > 1:
+            log.info("  等待 Turnstile iframe 重新出现 (最多 15s)...")
+            try:
+                WebDriverWait(driver, 15).until(
+                    lambda d: len(d.find_elements(By.CSS_SELECTOR,
+                                                  "div.cf-turnstile iframe")) > 0
+                    or len(d.find_elements(By.CSS_SELECTOR,
+                                           "iframe[src*='challenges.cloudflare.com']")) > 0
+                )
+            except TimeoutException:
+                log.info("  iframe 仍未出现，重试点击")
+
         log.info(f"  尝试点击 Turnstile checkbox (第 {attempt}/{max_click_retries} 次)...")
         clicked, status = _click_turnstile_checkbox(driver, log)
 
@@ -448,11 +489,20 @@ def fofa_search():
     ips = []
 
     try:
-        # ===== 登录 =====
-        for attempt in range(10):
-            log.info(f"登录尝试 {attempt + 1}/10 ...")
+        # ===== 登录（最多 3 次） =====
+        for attempt in range(3):
+            log.info(f"登录尝试 {attempt + 1}/3 ...")
             driver.get(LOGIN_PAGE)
-            time.sleep(3)
+
+            # 等 document.readyState=complete
+            try:
+                WebDriverWait(driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except TimeoutException:
+                log.info("  页面 readyState 超时，继续")
+
+            time.sleep(2)  # 给 Turnstile api.js 一点启动时间
 
             if "fofa.info" in driver.current_url and "login" not in driver.current_url.lower():
                 log.info("  ✅ 已登录")
