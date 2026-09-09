@@ -672,12 +672,13 @@ def fofa_search_via_api():
     log.info("===== 使用 FOFA API 搜索 IP =====")
     qbase64 = base64.b64encode(FOFA_QUERY.encode()).decode()
     url = "https://fofa.info/api/v1/search/all"
+    # 免费版只支持基础字段。as_organization、asn 等需要付费会员
     params = {
         "email": FOFA_EMAIL,
         "key": FOFA_API_KEY,
         "qbase64": qbase64,
         "size": FOFA_API_SIZE,
-        "fields": "ip,port,server,country,as_organization",
+        "fields": "ip,port,server,country",
     }
     log.info(f"API 请求: {url} (qbase64 长度={len(qbase64)}, size={FOFA_API_SIZE})")
 
@@ -690,7 +691,18 @@ def fofa_search_via_api():
         return []
 
     if data.get("error"):
-        log.error(f"❌ FOFA API 返回错误: {data.get('errmsg', data.get('error'))}")
+        err_msg = data.get('errmsg', data.get('error'))
+        log.error(f"❌ FOFA API 返回错误: {err_msg}")
+        # 常见错误码提示
+        err_str = str(err_msg)
+        if "820001" in err_str:
+            log.error("  → 提示: 字段权限不足，免费版只支持 ip/port/server/country 等基础字段")
+        elif "820000" in err_str:
+            log.error("  → 提示: 账号无 API 权限或 key 错误")
+        elif "820002" in err_str or "820003" in err_str:
+            log.error("  → 提示: API 调用次数耗尽或会员到期")
+        elif "820200" in err_str:
+            log.error("  → 提示: 查询语句语法错误")
         return []
 
     results = data.get("results", [])
