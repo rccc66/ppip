@@ -212,36 +212,71 @@ def handle_turnstile(driver, max_wait_checkbox=30, max_wait_token=30):
         if checkbox: break
 
         # 每 5s 打印一次诊断：页面上有多少 checkbox、多少 label
+        # 关键：用 JS 深度遍历，包括 shadow DOM 和 iframe
         if loop_count % 5 == 0:
             try:
                 info = driver.execute_script("""
+                    // 1) 主文档里的 checkbox
                     var cbs = document.querySelectorAll('input[type="checkbox"]');
                     var labels = document.querySelectorAll('label');
-                    var cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-                    var result = {
-                        checkboxCount: cbs.length,
-                        labelCount: labels.length,
-                        checkboxes: [],
-                        hasCfTokenInput: !!cfInput,
-                        cfTokenLen: cfInput ? (cfInput.value || '').length : 0
-                    };
-                    for (var i = 0; i < Math.min(cbs.length, 5); i++) {
-                        result.checkboxes.push({
-                            aria: cbs[i].getAttribute('aria-label') || '',
-                            id: cbs[i].id || '',
-                            name: cbs[i].name || '',
-                            visible: cbs[i].offsetWidth > 0 && cbs[i].offsetHeight > 0,
-                            rect: cbs[i].getBoundingClientRect().toJSON ?
-                                  cbs[i].getBoundingClientRect().toJSON() :
-                                  {x: cbs[i].getBoundingClientRect().x,
-                                   y: cbs[i].getBoundingClientRect().y,
-                                   w: cbs[i].getBoundingClientRect().width,
-                                   h: cbs[i].getBoundingClientRect().height}
+
+                    // 2) 检查 .cf-turnstile 内部
+                    var cfWidget = document.querySelector('div.cf-turnstile');
+                    var cfInnerHTML = cfWidget ? cfWidget.innerHTML.substring(0, 500) : 'no_widget';
+                    var cfChildrenCount = cfWidget ? cfWidget.children.length : 0;
+
+                    // 3) 检查 .cf-turnstile 内的 iframe（CF widget 通常用 iframe 包裹）
+                    var cfIframes = cfWidget ? cfWidget.querySelectorAll('iframe') : [];
+                    var cfIframeInfo = [];
+                    for (var i = 0; i < cfIframes.length; i++) {
+                        cfIframeInfo.push({
+                            id: cfIframes[i].id || '',
+                            src: (cfIframes[i].src || '').substring(0, 100),
+                            width: cfIframes[i].offsetWidth,
+                            height: cfIframes[i].offsetHeight
                         });
                     }
-                    return result;
+
+                    // 4) 全文档 iframe
+                    var allIframes = document.querySelectorAll('iframe');
+                    var allIframeInfo = [];
+                    for (var i = 0; i < allIframes.length; i++) {
+                        allIframeInfo.push({
+                            id: allIframes[i].id || '',
+                            src: (allIframes[i].src || '').substring(0, 80),
+                            w: allIframes[i].offsetWidth,
+                            h: allIframes[i].offsetHeight
+                        });
+                    }
+
+                    // 5) 检查 cf-turnstile-response token
+                    var cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+
+                    // 6) 检查是否有 shadow DOM 容器（CF 可能用）
+                    var turnstileWrapper = document.querySelector('.turnstile-wrapper');
+                    var wrapperHTML = turnstileWrapper ?
+                        turnstileWrapper.innerHTML.substring(0, 800) : 'no_wrapper';
+
+                    return {
+                        checkboxCount: cbs.length,
+                        labelCount: labels.length,
+                        cfChildrenCount: cfChildrenCount,
+                        cfInnerHTML: cfInnerHTML,
+                        cfIframeCount: cfIframes.length,
+                        cfIframeInfo: cfIframeInfo,
+                        totalIframeCount: allIframes.length,
+                        allIframeInfo: allIframeInfo,
+                        hasCfTokenInput: !!cfInput,
+                        cfTokenLen: cfInput ? (cfInput.value || '').length : 0,
+                        wrapperHTML: wrapperHTML
+                    };
                 """)
-                log.info(f"  [{loop_count}s] 诊断: {info}")
+                log.info(f"  [{loop_count}s] 诊断:")
+                for k, v in info.items():
+                    val_str = str(v)
+                    if len(val_str) > 200:
+                        val_str = val_str[:200] + "..."
+                    log.info(f"     {k}: {val_str}")
             except Exception as e:
                 log.info(f"  诊断异常: {e}")
 
