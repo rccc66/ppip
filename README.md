@@ -1,6 +1,6 @@
 # 项目说明
 
-本项目通过 **PPIP 检测接口** 拉取候选 IP，结合 **AbuseIPDB** 过滤纯净 IP，再用 **Cloudflare API** 自动维护 DNS 解析，并通过 **CloudflareST** 进行真实下载测速。
+本项目通过 **ProxyIP 检测接口** 拉取候选 IP，结合 **AbuseIPDB** 过滤纯净 IP，再用 **Cloudflare API** 自动维护 DNS 解析，并通过 **CloudflareST** 进行真实下载测速。
 
 整个流程完全基于 HTTP API，**不需要浏览器、不需要登录、不需要解验证码**。
 
@@ -9,10 +9,10 @@
 ## 📌 功能简介
 
 - ✅ 从 **PPIP** 检测接口拉取候选 IP 列表
-- ✅ 并发调用 **PPIP Check API** 验证 IP 可用性（含出口信息）
+- ✅ 并发调用 **ProxyIP Check API** 验证 IP 可用性（含出口信息）
 - ✅ 通过 **AbuseIPDB** 过滤纯净 IP（仅保留评分 `0` 的 IP）
 - ✅ 通过 **Cloudflare API** 自动添加 / 删除 DNS A 记录
-- ✅ DNS 生效后再次用 **PPIP Check API** 复检
+- ✅ DNS 生效后再次用 **ProxyIP Check API** 复检
 - ✅ 用 **CloudflareST** 对存活 IP 做真实下载测速并排序
 - ✅ 自动清理失败的 DNS 记录
 
@@ -40,7 +40,7 @@
 | `CLOUDFLARE_ZONE_ID` | ✅ | Cloudflare 的 Zone ID | `your_zone_id` |
 | `CLOUDFLARE_DOMAIN` | ✅ | Cloudflare 托管的**根域名**（不是子域名） | `your-domain.com` |
 | `CLOUDFLARE_DNS_NAME` | ❌ | 子域名前缀，默认 `us` | `us` |
-| `PPIP_SOURCE_DOMAIN` | ❌ | PPIP 候选 IP 源域名 | `your-ppip-source-domain` |
+| `PPIP_SOURCE_DOMAIN` | ❌ | ProxyIP 候选 IP 源域名 | `your-ProxyIP-source-domain` |
 | `PPIP_CHECK_LIMIT` | ❌ | 检测的 IP 数量上限，默认 `30` | `30` |
 | `PPIP_CONCURRENCY` | ❌ | 并发数，默认 `5` | `5` |
 | `CFST_BINARY` | ❌ | CloudflareST 二进制路径，默认 `./cfst` | `./cfst` |
@@ -57,7 +57,7 @@ CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
 CLOUDFLARE_ZONE_ID=your_zone_id
 CLOUDFLARE_DNS_NAME=us
 CLOUDFLARE_DOMAIN=your-domain.com
-PPIP_SOURCE_DOMAIN=your-ppip-source-domain
+PPIP_SOURCE_DOMAIN=your-ProxyIP-source-domain
 PPIP_CHECK_LIMIT=30
 PPIP_CONCURRENCY=5
 ```
@@ -90,14 +90,14 @@ Settings → Secrets and variables → Actions
 
 ---
 
-## 🛠 可自定义项
+## 🛠 可自定义项(所有自定义推荐使用变量进行更换，非必要不要更改代码)
 
 以下两项可以根据自己的需求修改（在 `update_dns.py` 顶部）：
 
-### 1. PPIP 候选 IP 源域名
+### 1. PProxyIP 候选 IP 源域名
 
 ```python
-PPIP_SOURCE_DOMAIN = os.getenv("PPIP_SOURCE_DOMAIN", "your-ppip-source-domain")
+PPIP_SOURCE_DOMAIN = os.getenv("ProxyIP_SOURCE_DOMAIN", "your-ProxyIP-source-domain")
 ```
 
 可替换为其它 PPIP 支持的源域名。
@@ -179,9 +179,9 @@ chmod +x cfst
 ```
 第 0 步：Cloudflare 配置校验（验证 Token / Zone / 域名）
    ↓
-第 1 步：从 PPIP /resolve 拉取候选 IP（约 50 个）
+第 1 步：从 ProxyIP /resolve 拉取候选 IP（约 50 个）
    ↓
-第 2 步：并发调用 PPIP /check 验证 IP 可用性
+第 2 步：并发调用 ProxyIP /check 验证 IP 可用性
    ↓
 第 3 步：AbuseIPDB 检测，只保留评分=0 的 IP
    ↓
@@ -189,7 +189,7 @@ chmod +x cfst
    ↓
 等 30 秒 DNS 生效
    ↓
-第 5 步：再次 PPIP /check 复检所有 DNS 记录
+第 5 步：再次 ProxyIP /check 复检所有 DNS 记录
    ↓
 第 6 步：清理失败的 DNS 记录
    ↓
@@ -202,9 +202,9 @@ chmod +x cfst
 
 - 请妥善保管你的 API Key、Token
 - 不要将敏感信息上传到公开仓库
-- 第三方接口（PPIP / AbuseIPDB）可能存在频率限制
+- 第三方接口（ProxyIP / AbuseIPDB）可能存在频率限制
 - AbuseIPDB 免费账户每天有查询次数限制（默认 1000 次/天）
-- PPIP 候选 IP 来自公开接口，可用性随时变化
+- ProxyIP 候选 IP 来自公开接口，可用性随时变化
 - 使用前请确保自己的操作符合相关法律法规及平台规则
 
 ---
