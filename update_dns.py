@@ -13,7 +13,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    TimeoutException,
+    WebDriverException,
+    StaleElementReferenceException,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
@@ -91,11 +95,16 @@ def create_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    # 反自动化特征，避免被 FOFA/WAF 拦截
+    options.add_argument("--disable-blink-features=AutomationControlled")
     headless_mode = False  # 如需无头请改为 True
 
     # 1️⃣ 锁定具体的浏览器执行路径优先级
-    browser_path = shutil.which("google-chrome") or shutil.which("google-chrome-stable") or shutil.which("chromium-browser") or shutil.which("chromium")
-    
+    browser_path = (shutil.which("google-chrome")
+                    or shutil.which("google-chrome-stable")
+                    or shutil.which("chromium-browser")
+                    or shutil.which("chromium"))
+
     detected_version = None
     if browser_path:
         try:
@@ -113,6 +122,169 @@ def create_driver():
         headless=headless_mode,
     )
     return driver
+
+
+# ---------- 验证码处理（修复版） ----------
+CAPTCHA_IMG_SELECTORS = [
+    (By.ID, "captcha_image"),
+    (By.ID, "captchaImage"),
+    (By.CSS_SELECTOR, "img[id*='captcha']"),
+    (By.CSS_SELECTOR, "img.captcha"),
+    (By.CSS_SELECTOR, "img[alt*='captcha' i]"),
+    (By.XPATH, "//img[contains(@src,'captcha') or contains(@src,'rucaptcha')]"),
+]
+CAPTCHA_INPUT_SELECTORS = [
+    (By.NAME, "_rucaptcha"),
+    (By.NAME, "captcha"),
+    (By.ID, "captcha"),
+    (By.CSS_SELECTOR, "input[name*='captcha' i]"),
+]
+
+
+def _switch_to_captcha_iframe(driver):
+    """如果验证码在 iframe 里，切进去；否则什么都不做。"""
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        for fr in iframes:
+            try:
+                driver.switch_to.frame(fr)
+                found = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "img[id*='captcha'], img[src*='captcha'], img[src*='rucaptcha']",
+                )
+                if found:
+                    return True
+                driver.switch_to.default_content()
+            except Exception:
+                driver.switch_to.default_content()
+                continue
+    except Exception:
+        driver.switch_to.default_content()
+    return False
+
+
+def _save_debug(driver, tag):
+    """失败时保存截图和 HTML，方便事后排查页面结构变化。"""
+    try:
+        driver.save_screenshot(f"debug_{tag}_{int(time.time())}.png")
+    except Exception:
+        pass
+    try:
+        html = driver.page_source or ""
+        with open(f"debug_{tag}_{int(time.time())}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass
+
+
+def handle_captcha(driver, ocr_fn, log):
+    """
+    在已打开登录页的 driver 上完成验证码识别并填入。
+    成功返回 True，失败返回 False。
+    """
+    in_iframe = _switch_to_captcha_iframe(driver)
+    log.info(f"  验证码 iframe 模式: {in_iframe}")
+
+    # 1) 等元素可见（而非仅 present），避免 screenshot_as_png 抛空 Message
+    captcha_img = None
+    used_selector = None
+    for by, sel in CAPTCHA_IMG_SELECTORS:
+        try:
+            captcha_img = WebDriverWait(driver, 4).until(
+                EC.visibility_of_element_located((by, sel))
+            )
+            used_selector = (by, sel)
+            break
+        except TimeoutException:
+            continue
+        except Exception as e:
+            log.info(f"  selector {sel} 异常: {type(e).__name__}: {str(e)[:200]}")
+            continue
+
+    if captcha_img is None:
+        log.info("  找不到可见验证码图片，可能页面结构已变更或改用滑块验证")
+        _save_debug(driver, "no_captcha")
+        if in_iframe:
+            driver.switch_to.default_content()
+        return False
+
+    # 2) 再等一下确保图片渲染完（避免 zero-size screenshot）
+    try:
+        WebDriverWait(driver, 3).until(
+            lambda d: captcha_img.size["width"] > 10 and captcha_img.size["height"] > 10
+        )
+    except Exception:
+        log.info(f"  验证码尺寸异常: {captcha_img.size}")
+        _save_debug(driver, "captcha_size")
+        if in_iframe:
+            driver.switch_to.default_content()
+        return False
+
+    # 3) 截图，分阶段捕获真正错误
+    try:
+        captcha_bytes = captcha_img.screenshot_as_png
+    except StaleElementReferenceException:
+        log.info("  验证码元素已失效（DOM 刷新）")
+        if in_iframe:
+            driver.switch_to.default_content()
+        return False
+    except WebDriverException as e:
+        # 这就是原来 "Message: 空字符串 + stacktrace" 的真凶
+        log.info(f"  验证码截图失败 WebDriverException: "
+                 f"msg={str(e.msg)[:300]!r}, stack={str(e.stacktrace)[:300]}")
+        _save_debug(driver, "screenshot_fail")
+        if in_iframe:
+            driver.switch_to.default_content()
+        return False
+    except Exception as e:
+        log.info(f"  验证码截图未知异常: {type(e).__name__}: {str(e)[:300]}")
+        _save_debug(driver, "screenshot_unknown")
+        if in_iframe:
+            driver.switch_to.default_content()
+        return False
+
+    # 4) OCR
+    try:
+        captcha_text = ocr_fn(captcha_bytes)
+    except Exception as e:
+        log.info(f"  OCR 异常: {type(e).__name__}: {str(e)[:300]}")
+        if in_iframe:
+            driver.switch_to.default_content()
+        return False
+
+    log.info(f"  验证码识别: {captcha_text!r} (selector={used_selector})")
+    if len(captcha_text) < 4:
+        try:
+            captcha_img.click()  # 点击刷新
+            time.sleep(1)
+        except Exception:
+            pass
+        if in_iframe:
+            driver.switch_to.default_content()
+        return False
+
+    # 5) 找输入框，可能在 iframe 外
+    if in_iframe:
+        driver.switch_to.default_content()
+
+    captcha_input = None
+    for by, sel in CAPTCHA_INPUT_SELECTORS:
+        try:
+            captcha_input = WebDriverWait(driver, 3).until(
+                EC.visibility_of_element_located((by, sel))
+            )
+            break
+        except TimeoutException:
+            continue
+    if captcha_input is None:
+        log.info("  找不到验证码输入框")
+        _save_debug(driver, "no_input")
+        return False
+
+    captcha_input.clear()
+    captcha_input.send_keys(captcha_text)
+    return True
+
 
 # ---------- FOFA 搜索 ----------
 def fofa_search():
@@ -142,26 +314,11 @@ def fofa_search():
                 password_input.send_keys(FOFA_PASSWORD)
             except TimeoutException:
                 log.info("  找不到登录表单")
+                _save_debug(driver, "no_login_form")
                 continue
 
-            try:
-                captcha_img = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.ID, "captcha_image"))
-                )
-                captcha_bytes = captcha_img.screenshot_as_png
-                captcha_text = ocr_captcha(captcha_bytes)
-                log.info(f"  验证码: {captcha_text}")
-
-                if len(captcha_text) < 4:
-                    captcha_img.click()
-                    time.sleep(1)
-                    continue
-
-                captcha_input = driver.find_element(By.NAME, "_rucaptcha")
-                captcha_input.clear()
-                captcha_input.send_keys(captcha_text)
-            except Exception as e:
-                log.info(f"  验证码处理失败: {e}")
+            # ===== 验证码处理（修复版） =====
+            if not handle_captcha(driver, ocr_captcha, log):
                 continue
 
             try:
@@ -187,6 +344,7 @@ def fofa_search():
 
             if "i.nosec.org" in driver.current_url:
                 log.info("  ❌ 验证码错误或登录失败")
+                _save_debug(driver, "login_fail")
                 time.sleep(1)
 
         # ===== 确保在 fofa.info 页面 =====
