@@ -131,26 +131,24 @@ def handle_turnstile(driver, max_wait_checkbox=30, max_wait_token=30):
       3. 等 token 生成或按钮启用（最多 30s）
     成功返回 True，失败返回 False。
     """
-    # 1) 等 .cf-turnstile 容器出现
+    # 1) 等任意 Turnstile 相关元素出现（容器或 token input）
     try:
         WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.cf-turnstile")))
+            lambda d: d.find_elements(By.CSS_SELECTOR, "div.cf-turnstile")
+                    or d.find_elements(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]'))
     except TimeoutException:
-        log.info("  未找到 .cf-turnstile 容器")
+        log.info("  未找到 Turnstile 容器")
         _save_debug(driver, "no_widget")
         return False
 
-    # 2) 等 checkbox 可见（关键修复：checkbox 不是立刻出现的，需要等几秒）
+    # 2) 等 checkbox 可见——关键：checkbox 不在 .cf-turnstile 里！
+    # CF 用 CSS Modules 生成随机 className（HZKZ0/YGJrG8/pgnB1 等），
+    # 每次刷新都变，所以只能用稳定的特征找：
+    #   - aria-label="请验证您是真人"（中文固定）
+    #   - 或任意 input[type=checkbox] 在含 "请验证您是真人" 文字的容器里
     log.info(f"  等待 Turnstile checkbox 出现 (最多 {max_wait_checkbox}s)...")
     checkbox = None
     deadline = time.time() + max_wait_checkbox
-    selectors = [
-        (By.CSS_SELECTOR, "div.cf-turnstile input[type='checkbox']"),
-        (By.CSS_SELECTOR, "div.cf-turnstile label input[type='checkbox']"),
-        (By.CSS_SELECTOR, "input[type='checkbox'][aria-label*='真人']"),
-        (By.CSS_SELECTOR, "input[type='checkbox'][aria-label*='verify' i]"),
-        (By.CSS_SELECTOR, "div.cf-turnstile label"),
-    ]
 
     while time.time() < deadline:
         # 先检查 token（万一 CF 自动通过了）
@@ -171,19 +169,36 @@ def handle_turnstile(driver, max_wait_checkbox=30, max_wait_token=30):
                 return True
         except Exception: pass
 
-        # 找 checkbox
-        for by, sel in selectors:
-            try:
-                for el in driver.find_elements(by, sel):
-                    try:
+        # 全文档搜 checkbox——用稳定的 aria-label 找
+        # CF Turnstile 的 checkbox 永远带 aria-label="请验证您是真人"（zh-CN 站点）
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]'):
+                try:
+                    aria = el.get_attribute("aria-label") or ""
+                    if "真人" in aria or "verify" in aria.lower() or "human" in aria.lower():
                         if el.is_displayed() and el.size.get("width", 0) > 5:
                             checkbox = el
-                            log.info(f"  ✅ checkbox 出现: {sel} (size={el.size})")
+                            log.info(f"  ✅ checkbox 出现 (aria='{aria}', size={el.size})")
                             break
+                except StaleElementReferenceException: continue
+                except Exception: continue
+        except Exception: pass
+
+        # 兜底：找含"请验证您是真人"文字的 label，点它
+        if not checkbox:
+            try:
+                for label in driver.find_elements(By.TAG_NAME, "label"):
+                    try:
+                        txt = label.text or ""
+                        if "真人" in txt or "verify" in txt.lower() or "human" in txt.lower():
+                            if label.is_displayed():
+                                checkbox = label
+                                log.info(f"  ✅ 找到 label: '{txt}'")
+                                break
                     except StaleElementReferenceException: continue
                     except Exception: continue
-                if checkbox: break
-            except Exception: continue
+            except Exception: pass
+
         if checkbox: break
         time.sleep(1)
 
