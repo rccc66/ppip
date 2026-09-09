@@ -156,11 +156,62 @@ def filter_clean_ips(valid_ips):
 
 
 # ---------- Cloudflare DNS 操作 ----------
+def _verify_cf_config():
+    """启动时校验 Cloudflare 配置——把 FQDN 和 zone 信息打印出来，方便定位 9000 错误"""
+    fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
+    log.info("===== Cloudflare 配置检查 =====")
+    log.info(f"  CLOUDFLARE_ZONE_ID: {CF_ZONE_ID}")
+    log.info(f"  CLOUDFLARE_DOMAIN: {CF_DOMAIN!r}")
+    log.info(f"  CLOUDFLARE_DNS_NAME: {CF_DNS_NAME!r}")
+    log.info(f"  拼接的 FQDN: {fqdn!r}")
+
+    # 校验 FQDN 格式
+    if not CF_DOMAIN or "." not in CF_DOMAIN:
+        log.error(f"❌ CLOUDFLARE_DOMAIN 不像根域名（应该含至少一个点）: {CF_DOMAIN!r}")
+        log.error("   请确认 GitHub Secret CLOUDFLARE_DOMAIN 是根域名，例如 example.com，不是 us.example.com")
+        return False
+    if not CF_DNS_NAME or not re.match(r'^[a-zA-Z0-9-]+$', CF_DNS_NAME):
+        log.error(f"❌ CLOUDFLARE_DNS_NAME 含非法字符: {CF_DNS_NAME!r}")
+        log.error("   只允许字母数字和连字符，例如 us / hk / jp")
+        return False
+
+    # 调用 CF API 验证 zone 是否存在 + token 是否有权限
+    try:
+        r = requests.get(f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}",
+                         headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+                         timeout=15)
+        if r.status_code == 200:
+            zone = r.json().get("result", {})
+            log.info(f"  ✅ Zone 验证通过: name={zone.get('name')!r}, status={zone.get('status')}")
+            # 关键校验：zone name 必须等于 CF_DOMAIN 或是其父域名
+            zone_name = zone.get("name", "")
+            if zone_name and zone_name != CF_DOMAIN:
+                log.error(f"❌ Zone 实际 name 是 {zone_name!r}，但 CLOUDFLARE_DOMAIN 是 {CF_DOMAIN!r}")
+                log.error(f"   请把 GitHub Secret CLOUDFLARE_DOMAIN 改成 {zone_name!r}")
+                return False
+            log.info(f"  ✅ Zone 与 CLOUDFLARE_DOMAIN 匹配")
+        elif r.status_code == 403:
+            log.error(f"❌ Token 无权限访问 zone（403）: {r.text[:200]}")
+            return False
+        elif r.status_code == 404:
+            log.error(f"❌ Zone 不存在（404），CLOUDFLARE_ZONE_ID 错了: {CF_ZONE_ID}")
+            return False
+        else:
+            log.error(f"❌ Zone 验证失败 HTTP {r.status_code}: {r.text[:200]}")
+            return False
+    except Exception as e:
+        log.error(f"❌ Zone 验证异常: {e}")
+        return False
+
+    return True
+
+
 def get_dns_records():
+    fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
     r = requests.get(CF_DNS_RECORDS_URL,
                      headers={"Authorization": f"Bearer {CF_API_TOKEN}",
                               "Content-Type": "application/json"},
-                     params={"type": "A", "name": f"{CF_DNS_NAME}.{CF_DOMAIN}"},
+                     params={"type": "A", "name": fqdn},
                      timeout=15)
     r.raise_for_status()
     return r.json().get("result", [])
@@ -179,7 +230,6 @@ def create_dns_record(ip):
                                "Content-Type": "application/json"},
                       json=payload, timeout=15)
     if r.status_code != 200:
-        # 打印 Cloudflare 返回的具体错误
         try:
             err = r.json()
             log.error(f"❌ 添加 {ip} 失败 HTTP {r.status_code}: {err}")
@@ -361,6 +411,11 @@ def cleanup_failed_ips(ip_status):
 # ---------- 主流程 ----------
 def main():
     import sys
+    # 第 0 步：先校验 Cloudflare 配置（避免做了一堆工作最后 DNS 加不上）
+    if not _verify_cf_config():
+        log.error("❌ Cloudflare 配置校验失败，请按上面提示修复 GitHub Secrets")
+        sys.exit(1)
+
     # 第一步：从 PPIP 拉取候选 IP
     targets = fetch_ips_from_ppip()
     if not targets:
