@@ -149,8 +149,11 @@ def handle_turnstile(driver, max_wait_checkbox=30, max_wait_token=30):
     log.info(f"  等待 Turnstile checkbox 出现 (最多 {max_wait_checkbox}s)...")
     checkbox = None
     deadline = time.time() + max_wait_checkbox
+    loop_count = 0
 
     while time.time() < deadline:
+        loop_count += 1
+
         # 先检查 token（万一 CF 自动通过了）
         try:
             token = driver.execute_script(
@@ -170,16 +173,24 @@ def handle_turnstile(driver, max_wait_checkbox=30, max_wait_token=30):
         except Exception: pass
 
         # 全文档搜 checkbox——用稳定的 aria-label 找
-        # CF Turnstile 的 checkbox 永远带 aria-label="请验证您是真人"（zh-CN 站点）
+        # 关键修复：CF 的 input[type=checkbox] 通常被 CSS 隐藏（opacity:0），
+        # 用 label 的伪元素显示视觉效果，所以 is_displayed() 会返回 False！
+        # 不检查 is_displayed()，只要 aria-label 匹配就尝试点击
         try:
             for el in driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]'):
                 try:
                     aria = el.get_attribute("aria-label") or ""
                     if "真人" in aria or "verify" in aria.lower() or "human" in aria.lower():
-                        if el.is_displayed() and el.size.get("width", 0) > 5:
-                            checkbox = el
-                            log.info(f"  ✅ checkbox 出现 (aria='{aria}', size={el.size})")
-                            break
+                        checkbox = el
+                        # 不再检查 is_displayed，直接用
+                        try:
+                            disp = el.is_displayed()
+                            sz = el.size
+                        except Exception:
+                            disp = "?"; sz = {}
+                        log.info(f"  ✅ 找到 checkbox (aria='{aria}', "
+                                 f"displayed={disp}, size={sz})")
+                        break
                 except StaleElementReferenceException: continue
                 except Exception: continue
         except Exception: pass
@@ -191,15 +202,49 @@ def handle_turnstile(driver, max_wait_checkbox=30, max_wait_token=30):
                     try:
                         txt = label.text or ""
                         if "真人" in txt or "verify" in txt.lower() or "human" in txt.lower():
-                            if label.is_displayed():
-                                checkbox = label
-                                log.info(f"  ✅ 找到 label: '{txt}'")
-                                break
+                            checkbox = label
+                            log.info(f"  ✅ 找到 label: '{txt}'")
+                            break
                     except StaleElementReferenceException: continue
                     except Exception: continue
             except Exception: pass
 
         if checkbox: break
+
+        # 每 5s 打印一次诊断：页面上有多少 checkbox、多少 label
+        if loop_count % 5 == 0:
+            try:
+                info = driver.execute_script("""
+                    var cbs = document.querySelectorAll('input[type="checkbox"]');
+                    var labels = document.querySelectorAll('label');
+                    var cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+                    var result = {
+                        checkboxCount: cbs.length,
+                        labelCount: labels.length,
+                        checkboxes: [],
+                        hasCfTokenInput: !!cfInput,
+                        cfTokenLen: cfInput ? (cfInput.value || '').length : 0
+                    };
+                    for (var i = 0; i < Math.min(cbs.length, 5); i++) {
+                        result.checkboxes.push({
+                            aria: cbs[i].getAttribute('aria-label') || '',
+                            id: cbs[i].id || '',
+                            name: cbs[i].name || '',
+                            visible: cbs[i].offsetWidth > 0 && cbs[i].offsetHeight > 0,
+                            rect: cbs[i].getBoundingClientRect().toJSON ?
+                                  cbs[i].getBoundingClientRect().toJSON() :
+                                  {x: cbs[i].getBoundingClientRect().x,
+                                   y: cbs[i].getBoundingClientRect().y,
+                                   w: cbs[i].getBoundingClientRect().width,
+                                   h: cbs[i].getBoundingClientRect().height}
+                        });
+                    }
+                    return result;
+                """)
+                log.info(f"  [{loop_count}s] 诊断: {info}")
+            except Exception as e:
+                log.info(f"  诊断异常: {e}")
+
         time.sleep(1)
 
     if not checkbox:
