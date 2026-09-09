@@ -178,7 +178,10 @@ jobs:
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
           FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
-          # 强烈推荐：FOFA API Key，绕过 Turnstile 浏览器登录
+          # 强烈推荐：Shodan API Key（免费，每月 100 次查询）
+          # 注册：https://www.shodan.io/dashboard
+          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
+          # 备选：FOFA API Key（需要 F 点）
           FOFA_API_KEY: ${{ secrets.FOFA_API_KEY }}
           # 可选：API 单次返回条数（默认 100，免费版上限 100）
           FOFA_API_SIZE: ${{ secrets.FOFA_API_SIZE }}
@@ -225,7 +228,7 @@ jobs:
           fi
 
       - name: List Debug Files
-        if: failure()
+        if: always()
         run: |
           echo "=== 当前目录文件 ==="
           ls -la
@@ -233,7 +236,7 @@ jobs:
           ls -la debug/ 2>/dev/null || echo "无 debug 目录"
 
       - name: Print Debug HTML (last final_fail) to log
-        if: failure()
+        if: always()
         run: |
           # 找最后一个 turnstile_final_fail 的 HTML，把内容直接打印到日志
           # 这样不用下载 artifact 也能看到页面 DOM
@@ -247,7 +250,7 @@ jobs:
           fi
 
       - name: Print Debug iframe info to log
-        if: failure()
+        if: always()
         run: |
           # 找最后一个 final_fail 的 iframes.txt
           LAST_IFRAMES=$(ls -t debug/debug_turnstile_final_fail_*.iframes.txt 2>/dev/null | head -1)
@@ -262,7 +265,7 @@ jobs:
           fi
 
       - name: Upload Debug Artifacts
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-${{ github.run_id }}
