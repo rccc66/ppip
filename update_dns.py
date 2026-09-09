@@ -32,7 +32,8 @@ FOFA_PASSWORD = os.getenv("FOFA_PASSWORD")
 # FOFA API：强烈推荐配置，绕过 Turnstile 浏览器登录
 FOFA_API_KEY = os.getenv("FOFA_API_KEY", "")
 # FOFA API 用的 qbase64 是 base64 编码后的查询，size 限制 100-10000
-FOFA_API_SIZE = int(os.getenv("FOFA_API_SIZE", "100"))
+_fofa_api_size_raw = (os.getenv("FOFA_API_SIZE") or "").strip()
+FOFA_API_SIZE = int(_fofa_api_size_raw) if _fofa_api_size_raw else 100
 # 可选：如果 Turnstile 自动通过失败，用 2captcha 兜底
 TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
 FOFA_QUERY = ('server=="cloudflare" && header="Forbidden" && country=="US" && '
