@@ -7,12 +7,14 @@ import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
     NoSuchElementException,
+    StaleElementReferenceException,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -39,13 +41,34 @@ LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f
 
 # ---------- Chrome 驱动 ----------
 def create_driver():
+    """
+    在 GitHub Actions / FORCE_PROXY 环境下强制 Chrome 走 SOCKS5 代理：
+      - 配置了 SOCKS5_PROXY secret → 走 gost 桥接的 127.0.0.1:1080（住宅代理）
+      - 没配置 SOCKS5_PROXY     → 直连 WARP 40000 端口（CF WARP 出口 IP）
+
+    WARP 出口是 Cloudflare 自己的 IP 段，对 Turnstile 友好得多。
+    """
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--lang=zh-CN,zh;q=0.9")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    headless_mode = False  # 配合 xvfb-run，如需纯无头请改 True
+
+    # 关键：代理设置（仿照 Hohai 脚本 v6 策略）
+    if os.getenv("GITHUB_ACTIONS") or os.getenv("FORCE_PROXY"):
+        if os.getenv("SOCKS5_PROXY"):
+            proxy_addr = "socks5://127.0.0.1:1080"
+        else:
+            proxy_addr = "socks5://127.0.0.1:40000"
+        options.add_argument(f"--proxy-server={proxy_addr}")
+        log.info(f"🌐 已配置 Chrome 走 SOCKS5 代理: {proxy_addr}")
+    elif os.getenv("SOCKS5_PROXY"):
+        options.add_argument("--proxy-server=socks5://127.0.0.1:1080")
+        log.info("🌐 已配置 Chrome 走 SOCKS5 代理: 127.0.0.1:1080")
+
+    headless_mode = False  # 配合 xvfb-run
 
     browser_path = (shutil.which("google-chrome")
                     or shutil.which("google-chrome-stable")
@@ -67,7 +90,39 @@ def create_driver():
         version_main=detected_version,
         headless=headless_mode,
     )
+    driver.implicitly_wait(5)
+
+    # 启动后验证代理是否真的工作
+    if os.getenv("GITHUB_ACTIONS") or os.getenv("FORCE_PROXY"):
+        _verify_proxy_working(driver)
+
     return driver
+
+
+def _verify_proxy_working(driver):
+    """启动后验证代理确实工作，并打印出口 IP（仿 Hohai 脚本）。"""
+    try:
+        driver.set_page_load_timeout(20)
+        driver.get("https://api.ipify.org?format=text")
+        time.sleep(2)
+        body = driver.find_element(By.TAG_NAME, "body").text.strip()
+        log.info(f"🌐 Chrome 出口 IP (经代理): {body}")
+
+        try:
+            direct = subprocess.check_output(
+                ["curl", "-4", "-s", "--max-time", "5", "https://api.ipify.org"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            log.info(f"🌐 系统直连 IP: {direct}")
+
+            if direct and body and direct == body:
+                log.warning("⚠️  警告: Chrome 出口 IP 与系统直连 IP 相同, 代理可能未生效!")
+            else:
+                log.info("✅ 代理已生效, Chrome 出口 IP 与直连不同")
+        except Exception:
+            pass
+    except Exception as e:
+        log.error(f"❌ 代理验证失败: {e}")
 
 
 # ---------- 调试工具 ----------
@@ -165,12 +220,136 @@ def _inject_turnstile_token(driver, token):
         return False
 
 
-def handle_turnstile(driver, log, auto_timeout=25):
+def _click_turnstile_checkbox(driver, log):
+    """
+    物理点击 Turnstile iframe（仿 Hohai 脚本策略）。
+    不再纠结找具体的 checkbox 元素，而是：
+      1) 在主文档里扫所有 iframe，按 src 过滤出 Cloudflare 的
+      2) 切入后用 ActionChains 物理移动鼠标到 body 并点击
+      3) 轮询主文档里 Turnstile widget 的状态 div 判断结果
+
+    返回 (success: bool, status: str)
+      status ∈ {"success", "verifying_timeout", "failed", "expired",
+                "no_iframe", "click_error"}
+    """
+    # 1) 扫描所有 iframe，找 Cloudflare Turnstile 的那个
+    target_iframe = None
+    try:
+        all_iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        log.info(f"  页面 iframe 总数: {len(all_iframes)}")
+        for f in all_iframes:
+            try:
+                if not f.is_displayed():
+                    continue
+                src = f.get_attribute("src") or ""
+                if ("cloudflare" in src or "turnstile" in src or "challenges" in src):
+                    target_iframe = f
+                    log.info(f"  锁定 CF iframe, src={src[:100]}")
+                    break
+            except StaleElementReferenceException:
+                continue
+            except Exception:
+                continue
+
+        # 兜底：在 .cf-turnstile 容器内找
+        if target_iframe is None:
+            try:
+                container = driver.find_element(By.CSS_SELECTOR, "div.cf-turnstile")
+                inner_iframes = container.find_elements(By.TAG_NAME, "iframe")
+                for f in inner_iframes:
+                    if f.is_displayed():
+                        target_iframe = f
+                        log.info("  在 .cf-turnstile 容器内找到 iframe")
+                        break
+            except Exception:
+                pass
+    except Exception as e:
+        log.info(f"  扫描 iframe 异常: {type(e).__name__}: {str(e)[:200]}")
+
+    if target_iframe is None:
+        log.info("  未找到 Turnstile iframe")
+        _save_debug(driver, "no_iframe")
+        return False, "no_iframe"
+
+    # 2) 切入 iframe，用 ActionChains 物理点击 body
+    try:
+        driver.switch_to.frame(target_iframe)
+        box = driver.find_element(By.CSS_SELECTOR, "body")
+        # 关键：用 ActionChains 物理移动鼠标并点击，模拟真人
+        ActionChains(driver).move_to_element(box).click().perform()
+        log.info("  👉 已用 ActionChains 物理点击 CF iframe body")
+    except Exception as e:
+        log.info(f"  物理点击失败: {type(e).__name__}: {str(e)[:200]}")
+        _save_debug(driver, "click_error")
+        return False, "click_error"
+    finally:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    # 3) 轮询主文档里的 Turnstile 状态 div（最多 30s）
+    # FOFA 的 Turnstile widget 用 div.JrdWD7 包裹各种状态文案
+    for _ in range(15):
+        time.sleep(2)
+        try:
+            state_divs = driver.find_elements(By.CSS_SELECTOR, "div.JrdWD7")
+            for div in state_divs:
+                try:
+                    style = div.get_attribute("style") or ""
+                    style_norm = style.replace(" ", "")
+                    if "display:none" in style_norm or "visibility:hidden" in style_norm:
+                        continue
+                    text = (div.text or "").strip()
+                    if not text:
+                        continue
+                    if "成功" in text:
+                        log.info(f"  Turnstile 状态: 成功 ({text})")
+                        return True, "success"
+                    if "失败" in text:
+                        log.info(f"  Turnstile 状态: 失败 ({text})")
+                        return False, "failed"
+                    if "过期" in text:
+                        log.info(f"  Turnstile 状态: 过期 ({text})")
+                        return False, "expired"
+                    # "正在验证…" 等继续等
+                except StaleElementReferenceException:
+                    continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 兜底：如果状态 div 没找到，但提交按钮已经启用了，也算成功
+        if _submit_button_enabled(driver):
+            log.info("  Turnstile 状态: 提交按钮已启用 (视为成功)")
+            return True, "success"
+
+    log.info("  点击后状态轮询超时（30s 内未到终态）")
+    return False, "verifying_timeout"
+
+
+def _refresh_turnstile(driver, log):
+    """点击刷新链接（验证失败/过期时）。"""
+    try:
+        # 先在主文档找
+        refresh_links = driver.find_elements(By.CSS_SELECTOR, "a[href='#refresh']")
+        if refresh_links:
+            driver.execute_script("arguments[0].click();", refresh_links[0])
+            log.info("  已点击刷新链接")
+            time.sleep(2)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def handle_turnstile(driver, log, auto_timeout=25, max_click_retries=3):
     """
     FOFA 登录页使用 Cloudflare Turnstile 替代图片验证码。
     策略：
       1) 主：等 Turnstile managed 模式自动通过（uc + 真实指纹下常自动放行）
-      2) 兜底 A：手动点击 Turnstile 复选框 iframe
+      2) 兜底 A：手动点击 Turnstile iframe 内 checkbox，最多重试 max_click_retries 次
       3) 兜底 B：2captcha 外部打码（需配置 TWOCAPTCHA_API_KEY）
     成功返回 True，失败返回 False。
     """
@@ -201,56 +380,50 @@ def handle_turnstile(driver, log, auto_timeout=25):
         log.info("  ✅ Turnstile 自动通过，提交按钮已启用")
         return True
     except TimeoutException:
-        log.info("  Turnstile 未自动通过")
-        _save_debug(driver, "turnstile_auto_fail")
+        log.info("  Turnstile 未自动通过，转为点击 checkbox")
 
-    # 3) 兜底 A：点击 Turnstile iframe 内复选框
-    log.info("  尝试点击 Turnstile 复选框...")
-    clicked = False
-    try:
-        turnstile_div = driver.find_element(By.CSS_SELECTOR, "div.cf-turnstile")
-        # Turnstile 渲染后会在 .cf-turnstile 内注入 iframe
-        iframes = turnstile_div.find_elements(By.CSS_SELECTOR, "iframe")
-        # 也可能在文档别处
-        if not iframes:
-            iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
-        for iframe in iframes:
-            try:
-                driver.switch_to.frame(iframe)
-                for sel in [
-                    (By.CSS_SELECTOR, "input[type='checkbox']"),
-                    (By.CSS_SELECTOR, "label"),
-                    (By.CSS_SELECTOR, "#cf-turnstile-widget"),
-                    (By.CSS_SELECTOR, "body"),
-                ]:
-                    try:
-                        el = driver.find_element(*sel)
-                        el.click()
-                        clicked = True
-                        log.info(f"  在 iframe 内点击了 {sel}")
-                        break
-                    except Exception:
-                        continue
-                driver.switch_to.default_content()
-                if clicked:
-                    break
-            except Exception:
-                driver.switch_to.default_content()
-                continue
-    except Exception as e:
-        log.info(f"  点击 Turnstile 异常: {type(e).__name__}: {str(e)[:200]}")
-        driver.switch_to.default_content()
+    # 3) 兜底 A：点击 checkbox，最多重试 max_click_retries 次
+    for attempt in range(1, max_click_retries + 1):
+        log.info(f"  尝试点击 Turnstile checkbox (第 {attempt}/{max_click_retries} 次)...")
+        clicked, status = _click_turnstile_checkbox(driver, log)
 
-    if clicked:
-        try:
-            WebDriverWait(driver, 10).until(_submit_button_enabled)
+        if status == "success":
             log.info("  ✅ 点击后 Turnstile 通过")
-            return True
-        except TimeoutException:
-            log.info("  点击后仍未通过")
+            # 等提交按钮启用（onTurnstileSuccess 回调触发）
+            try:
+                WebDriverWait(driver, 5).until(_submit_button_enabled)
+                return True
+            except TimeoutException:
+                log.info("  Turnstile 通过但按钮未启用，JS 强制启用")
+                try:
+                    btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                    driver.execute_script("arguments[0].disabled = false;", btn)
+                    return True
+                except Exception:
+                    pass
+
+        if status in ("failed", "expired"):
+            log.info(f"  状态={status}，刷新后重试")
+            _refresh_turnstile(driver, log)
+            continue
+
+        if status == "no_iframe":
+            # iframe 还没渲染完，等一下再试
+            time.sleep(3)
+            continue
+
+        if status == "verifying_timeout":
+            # 验证中但超时，刷新重试
+            _refresh_turnstile(driver, log)
+            time.sleep(2)
+            continue
+
+        # click_error 等其他情况
+        _save_debug(driver, f"click_{status}")
+        time.sleep(2)
 
     # 4) 兜底 B：2captcha 外部打码
-    if sitekey:
+    if sitekey and TWOCAPTCHA_API_KEY:
         token = _solve_turnstile_with_2captcha(driver, log, sitekey, page_url)
         if token:
             if _inject_turnstile_token(driver, token):
@@ -260,7 +433,9 @@ def handle_turnstile(driver, log, auto_timeout=25):
                     return True
                 except TimeoutException:
                     log.info("  token 已注入但按钮未启用，尝试直接提交")
-                    return True  # 即使按钮没启用，token 已在表单里，提交时也会带上
+                    return True
+    elif not TWOCAPTCHA_API_KEY:
+        log.info("  未配置 TWOCAPTCHA_API_KEY，跳过外部打码")
 
     log.info("  ❌ Turnstile 验证未通过")
     _save_debug(driver, "turnstile_final_fail")
