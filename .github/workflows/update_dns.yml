@@ -8,7 +8,7 @@ on:
 jobs:
   update_dns:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -29,28 +29,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run update_dns.py
         env:
-          # 必填
           ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
-          # 可选
           CLOUDFLARE_DNS_NAME: ${{ secrets.CLOUDFLARE_DNS_NAME }}
           PPIP_SOURCE_DOMAIN: ${{ secrets.PPIP_SOURCE_DOMAIN }}
           PPIP_CHECK_LIMIT: ${{ secrets.PPIP_CHECK_LIMIT }}
           PPIP_CONCURRENCY: ${{ secrets.PPIP_CONCURRENCY }}
-          # 浏览器复检需要 WARP（check.proxyip.cmliussss.net 走 WARP）
-          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
-          GITHUB_ACTIONS: true
-          USE_XVFB: true
-          FORCE_PROXY: "true"
         run: |
           n=0
           until [ "$n" -ge 3 ]; do
@@ -58,7 +49,7 @@ jobs:
             echo "开始执行任务，第 $((n+1)) 次"
             echo "=============================="
 
-            xvfb-run -a --server-args="-screen 0 1920x1080x24" python update_dns.py
+            python update_dns.py
             code=$?
 
             echo "脚本退出码: $code"
@@ -89,9 +80,6 @@ jobs:
         with:
           name: debug-${{ github.run_id }}
           path: |
-            debug/
-            *.png
-            *.html
             *.txt
             *.log
             *.csv
