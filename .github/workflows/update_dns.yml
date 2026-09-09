@@ -232,6 +232,35 @@ jobs:
           echo "=== debug/ 目录文件 ==="
           ls -la debug/ 2>/dev/null || echo "无 debug 目录"
 
+      - name: Print Debug HTML (last final_fail) to log
+        if: failure()
+        run: |
+          # 找最后一个 turnstile_final_fail 的 HTML，把内容直接打印到日志
+          # 这样不用下载 artifact 也能看到页面 DOM
+          LAST_HTML=$(ls -t debug/debug_turnstile_final_fail_*.html 2>/dev/null | head -1)
+          if [ -n "$LAST_HTML" ]; then
+            echo "================================================"
+            echo "页面 HTML 内容 ($LAST_HTML):"
+            echo "================================================"
+            cat "$LAST_HTML" | head -200
+            echo "================================================"
+          fi
+
+      - name: Print Debug iframe info to log
+        if: failure()
+        run: |
+          # 找最后一个 final_fail 的 iframes.txt
+          LAST_IFRAMES=$(ls -t debug/debug_turnstile_final_fail_*.iframes.txt 2>/dev/null | head -1)
+          if [ -n "$LAST_IFRAMES" ]; then
+            echo "=== iframes.txt 内容 ==="
+            cat "$LAST_IFRAMES"
+          fi
+          LAST_CONSOLE=$(ls -t debug/debug_turnstile_final_fail_*.console.log 2>/dev/null | head -1)
+          if [ -n "$LAST_CONSOLE" ]; then
+            echo "=== console.log 内容 ==="
+            cat "$LAST_CONSOLE"
+          fi
+
       - name: Upload Debug Artifacts
         if: failure()
         uses: actions/upload-artifact@v4
