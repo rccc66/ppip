@@ -172,13 +172,20 @@ def create_dns_record(ip):
         if r["content"] == ip:
             log.info(f"IP {ip} 已存在")
             return
+    payload = {"type": "A", "name": fqdn, "content": ip,
+               "ttl": 1, "proxied": False}
     r = requests.post(CF_DNS_RECORDS_URL,
                       headers={"Authorization": f"Bearer {CF_API_TOKEN}",
                                "Content-Type": "application/json"},
-                      json={"type": "A", "name": fqdn, "content": ip,
-                            "ttl": 1, "proxied": False},
-                      timeout=15)
-    r.raise_for_status()
+                      json=payload, timeout=15)
+    if r.status_code != 200:
+        # 打印 Cloudflare 返回的具体错误
+        try:
+            err = r.json()
+            log.error(f"❌ 添加 {ip} 失败 HTTP {r.status_code}: {err}")
+        except Exception:
+            log.error(f"❌ 添加 {ip} 失败 HTTP {r.status_code}: {r.text[:300]}")
+        r.raise_for_status()
     log.info(f"已添加 DNS: {fqdn} -> {ip}")
 
 
@@ -192,14 +199,20 @@ def delete_dns_record(rid, ip):
 
 
 def add_ips_to_dns(clean_ips):
-    """添加 IP 到 Cloudflare DNS"""
+    """添加 IP 到 Cloudflare DNS，返回成功添加的 IP 列表"""
     log.info(f"===== 第四步：添加 DNS 记录 =====")
-    for item in clean_ips:
+    added = []
+    for idx, item in enumerate(clean_ips, 1):
+        ip = item["ip"]
         try:
-            create_dns_record(item["ip"])
-            time.sleep(0.5)
+            create_dns_record(ip)
+            added.append(ip)
         except Exception as e:
-            log.info(f"添加失败 {item['ip']}: {e}")
+            # create_dns_record 内部已打印详细错误，这里只做汇总
+            pass
+        time.sleep(0.3)
+    log.info(f"添加成功 {len(added)}/{len(clean_ips)} 个 IP")
+    return added
 
 
 # ---------- 第五步：浏览器复检 ProxyIP（用检测页） ----------
@@ -366,8 +379,12 @@ def main():
         log.error("❌ 无纯净 IP")
         sys.exit(1)
 
-    # 第四步：添加到 Cloudflare DNS
-    add_ips_to_dns(clean_ips)
+    # 第四步：添加到 Cloudflare DNS（关键：检查是否至少有 1 个成功）
+    added_ips = add_ips_to_dns(clean_ips)
+    if not added_ips:
+        log.error("❌ DNS 添加全部失败，请检查 CLOUDFLARE_API_TOKEN 权限 / CLOUDFLARE_ZONE_ID / CLOUDFLARE_DOMAIN")
+        sys.exit(1)
+    log.info(f"成功添加 {len(added_ips)} 个 DNS 记录")
 
     # 第五步：浏览器复检
     ip_status = verify_proxyips_via_browser()
