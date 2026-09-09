@@ -58,7 +58,9 @@ def create_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--lang=zh-CN,zh;q=0.9")
+    # 关键：用 --lang=zh-CN 才能改 navigator.language；uc 默认是 en-US
+    # 注意 uc 用 prefs 才能让 navigator.languages 也跟着变
+    options.add_argument("--lang=zh-CN")
     options.add_argument("--disable-blink-features=AutomationControlled")
     # 增强：让 uc 指纹更接近真实浏览器
     options.add_argument("--disable-features=IsolateOrigins,site-per-process,AutomationControlled")
@@ -73,6 +75,14 @@ def create_driver():
     options.add_argument("--log-level=0")
     options.add_argument("--v=0")
     options.set_capability("goog:loggingPrefs", {"browser": "ALL", "driver": "ALL"})
+
+    # 关键：用 prefs 让 navigator.languages 真正变成 zh-CN
+    # 这是 CF 指纹检测的关键之一——UA 说 zh-CN 但 navigator.languages 是 en-US 就露馅
+    prefs = {
+        "intl.accept_languages": "zh-CN,zh",
+        "intl.notification_locale": "zh-CN",
+    }
+    options.add_experimental_option("prefs", prefs)
 
     # 关键：代理设置（仿照 Hohai 脚本 v6 策略）
     if os.getenv("GITHUB_ACTIONS") or os.getenv("FORCE_PROXY"):
@@ -109,6 +119,117 @@ def create_driver():
         headless=headless_mode,
     )
     driver.implicitly_wait(5)
+
+    # 关键反检测：在每个新页面加载前注入 JS，修补指纹矛盾
+    # 这比 Chrome args 更彻底，因为 args 改不了 navigator.languages
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": """
+                // 1) 修补 navigator.languages（CF 检测 UA 说 zh-CN 但 languages 是 en-US）
+                try {
+                    Object.defineProperty(navigator, 'languages', {
+                        get: function() { return ['zh-CN', 'zh', 'en-US', 'en']; }
+                    });
+                    Object.defineProperty(navigator, 'language', {
+                        get: function() { return 'zh-CN'; }
+                    });
+                } catch(e) {}
+
+                // 2) 修补 navigator.platform（与 UA 的 Linux x86_64 一致）
+                try {
+                    Object.defineProperty(navigator, 'platform', {
+                        get: function() { return 'Linux x86_64'; }
+                    });
+                } catch(e) {}
+
+                // 3) 彻底清除 webdriver 标志（uc 已部分做了，但再保险一次）
+                try {
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: function() { return undefined; }
+                    });
+                } catch(e) {}
+
+                // 4) 修补 navigator.plugins（CF 检测空 plugins 数组=自动化）
+                try {
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: function() {
+                            return [
+                                {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer',
+                                 description: 'Portable Document Format'},
+                                {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer',
+                                 description: ''},
+                                {name: 'Native Client', filename: 'internal-nacl-plugin',
+                                 description: ''}
+                            ];
+                        }
+                    });
+                } catch(e) {}
+
+                // 5) 修补 navigator.permissions.query（CF 检测自动化会返回异常）
+                try {
+                    var origQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = function(params) {
+                        if (params && params.name === 'notifications') {
+                            return Promise.resolve({state: Notification.permission});
+                        }
+                        return origQuery.call(window.navigator.permissions, params);
+                    };
+                } catch(e) {}
+
+                // 6) 修补 window.chrome（uc 缺这个对象，CF 检测 chrome.runtime 是否存在）
+                try {
+                    if (!window.chrome) {
+                        window.chrome = {};
+                    }
+                    if (!window.chrome.runtime) {
+                        window.chrome.runtime = {
+                            PlatformOs: {MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros',
+                                         LINUX: 'linux', OPENBSD: 'openbsd'},
+                            PlatformArch: {ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64'},
+                            PlatformNaclArch: {ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64'},
+                            connect: function() {},
+                            sendMessage: function() {}
+                        };
+                    }
+                    if (!window.chrome.csi) {
+                        window.chrome.csi = function() { return {}; };
+                    }
+                    if (!window.chrome.loadTimes) {
+                        window.chrome.loadTimes = function() {
+                            return {
+                                commitLoadTime: Date.now() / 1000 - 5,
+                                connectionInfo: 'h2',
+                                finishDocumentLoadTime: Date.now() / 1000 - 3,
+                                finishLoadTime: Date.now() / 1000 - 2,
+                                firstPaintAfterLoadTime: 0,
+                                firstPaintTime: Date.now() / 1000 - 4,
+                                navigationType: 'Other',
+                                npnNegotiatedProtocol: 'h2',
+                                requestTime: Date.now() / 1000 - 6,
+                                startLoadTime: Date.now() / 1000 - 6,
+                                wasAlternateProtocolAvailable: false,
+                                wasFetchedViaSpdy: true,
+                                wasNpnNegotiated: true
+                            };
+                        };
+                    }
+                } catch(e) {}
+
+                // 7) WebGL Vendor/Renderer 修补（CF 检测 SwiftShader=自动化）
+                try {
+                    var getParameter = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(param) {
+                        if (param === 37445) return 'Intel Inc.';          // UNMASKED_VENDOR_WEBGL
+                        if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+                        return getParameter.call(this, param);
+                    };
+                } catch(e) {}
+            """}
+        )
+        log.info("✅ 已注入反指纹检测脚本")
+    except Exception as e:
+        log.warning(f"⚠️  反指纹脚本注入失败: {e}")
 
     # 启用 console log 抓取（用于诊断 Turnstile 错误）
     try:
