@@ -348,15 +348,18 @@ def _refresh_turnstile(driver, log):
     return False
 
 
-def handle_turnstile(driver, log, auto_timeout=25, max_click_retries=3):
+def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
     """
     FOFA 登录页使用 Cloudflare Turnstile 替代图片验证码。
-    策略：
-      1) 等 Turnstile widget 渲染完成（div.cf-turnstile 出现 + iframe 注入完成）
-      2) 主：等 Turnstile managed 模式自动通过（uc + 真实指纹下常自动放行）
-      3) 兜底 A：手动 ActionChains 物理点击 Turnstile iframe，最多重试 max_click_retries 次
-      4) 兜底 B：2captcha 外部打码（需配置 TWOCAPTCHA_API_KEY）
-    成功返回 True，失败返回 False。
+    实测发现：FOFA 页面 render 后 widget 内会创建 div + input，但 iframe 不一定出现。
+    新策略：
+      1) 等 .cf-turnstile 容器出现
+      2) 等 window.turnstile api.js 加载完成
+      3) 检查 widget 内部状态（iframe 数 + token value）
+      4) 如果 iframe=0 且 token 空，主动调 turnstile.reset() / render() 强制重启
+      5) 监听 cf-turnstile-response 的 value 变化（最可靠的成功信号）
+      6) 兜底 A：ActionChains 物理点击 iframe
+      7) 兜底 B：2captcha 外部打码
     """
     # 1) 等待 Turnstile 容器 div 出现
     try:
@@ -368,30 +371,26 @@ def handle_turnstile(driver, log, auto_timeout=25, max_click_retries=3):
         _save_debug(driver, "no_turnstile_div")
         return False
 
-    # 2) 关键：等 Turnstile api.js 把 iframe 注入到 .cf-turnstile 内部
-    # 这是上次失败的根本原因——只等 div 出现，但 iframe 还没异步渲染好
-    log.info("  等待 Turnstile iframe 注入完成 (最多 20s)...")
-    try:
-        WebDriverWait(driver, 20).until(
-            lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.cf-turnstile iframe")) > 0
-            or len(d.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")) > 0
-        )
-        log.info("  ✅ Turnstile iframe 已注入")
-    except TimeoutException:
-        # iframe 没出现但可能 Turnstile 已自动通过（managed 模式下有时会跳过 widget）
-        log.info("  Turnstile iframe 未注入，检查是否已自动通过")
+    # 2) 等 window.turnstile 加载
+    log.info("  等待 window.turnstile api.js 加载 (最多 15s)...")
+    turnstile_loaded = False
+    for _ in range(15):
         try:
-            # 直接看提交按钮是否已启用
-            btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
-            if btn.is_enabled() and not btn.get_attribute("disabled"):
-                log.info("  ✅ 提交按钮已启用，Turnstile 自动通过")
-                return True
+            loaded = driver.execute_script(
+                "return typeof window.turnstile !== 'undefined' && window.turnstile !== null;"
+            )
+            if loaded:
+                turnstile_loaded = True
+                log.info("  ✅ window.turnstile 已加载")
+                break
         except Exception:
             pass
-        _save_debug(driver, "no_iframe_injected")
-        # 不直接 return，让后续逻辑兜底
+        time.sleep(1)
+    if not turnstile_loaded:
+        log.info("  ❌ window.turnstile 未加载，可能 api.js 被拦或网络异常")
+        _save_debug(driver, "no_turnstile_api")
 
-    # 取 sitekey 和 page_url，给兜底 B 用
+    # 3) 取 sitekey 和 page_url
     sitekey = None
     page_url = driver.current_url
     try:
@@ -401,69 +400,189 @@ def handle_turnstile(driver, log, auto_timeout=25, max_click_retries=3):
         pass
     log.info(f"  Turnstile sitekey={sitekey}, page={page_url}")
 
-    # 3) 主策略：等提交按钮自动启用
+    # 4) 检查 widget 当前状态
+    def _get_widget_state():
+        try:
+            return driver.execute_script("""
+                var widget = document.querySelector('div.cf-turnstile');
+                if (!widget) return {found: false};
+                var iframes = widget.querySelectorAll('iframe');
+                var inputs = widget.querySelectorAll('input[name="cf-turnstile-response"]');
+                var inputValue = inputs.length > 0 ? inputs[0].value : '';
+                var allIframes = document.querySelectorAll('iframe');
+                var cfIframes = [];
+                allIframes.forEach(function(f) {
+                    var src = f.src || '';
+                    if (src.indexOf('cloudflare') >= 0 || src.indexOf('challenges') >= 0) {
+                        cfIframes.push(src.substring(0, 80));
+                    }
+                });
+                return {
+                    found: true,
+                    iframeCount: iframes.length,
+                    cfIframeSrcs: cfIframes,
+                    totalIframes: allIframes.length,
+                    tokenValue: inputValue,
+                    tokenLength: inputValue.length
+                };
+            """)
+        except Exception as e:
+            log.info(f"  获取 widget 状态异常: {type(e).__name__}: {str(e)[:200]}")
+            return {"found": False}
+
+    state = _get_widget_state()
+    log.info(f"  widget 初始状态: {state}")
+
+    # 5) 主动调 turnstile.reset() / render() 强制重启
+    if state.get("found") and state.get("iframeCount", 0) == 0 and not state.get("tokenValue"):
+        log.info("  widget 内无 iframe 且无 token, 主动调 turnstile.reset()...")
+        reset_result = driver.execute_script("""
+            try {
+                var widget = document.querySelector('div.cf-turnstile');
+                if (!widget) return 'no_widget';
+                if (!window.turnstile) return 'no_turnstile_api';
+
+                // 找 widget ID (从 input id 提取: cf-chl-widget-XXX_response -> cf-chl-widget-XXX)
+                var inputs = widget.querySelectorAll('input[id^="cf-chl-widget-"]');
+                var widgetId = null;
+                if (inputs.length > 0) {
+                    widgetId = inputs[0].id.replace('_response', '');
+                }
+
+                if (widgetId && window.turnstile.reset) {
+                    try {
+                        window.turnstile.reset(widgetId);
+                        return 'reset_ok: ' + widgetId;
+                    } catch(e1) {
+                        // reset 失败, 走 render 流程
+                    }
+                }
+
+                // fallback: 移除原 widget 内容, 重新 render
+                widget.innerHTML = '';
+                var sitekey = widget.getAttribute('data-sitekey');
+                var action = widget.getAttribute('data-action');
+                window.turnstile.render(widget, {
+                    sitekey: sitekey,
+                    action: action,
+                    callback: function(token) {
+                        var input = document.querySelector('input[name="cf-turnstile-response"]');
+                        if (!input) {
+                            input = document.createElement('input');
+                            input.type = 'hidden';
+                            input.name = 'cf-turnstile-response';
+                            var form = document.querySelector('form#login-form');
+                            if (form) form.appendChild(input);
+                        }
+                        input.value = token;
+                        if (typeof window.onTurnstileSuccess === 'function') {
+                            window.onTurnstileSuccess();
+                        }
+                    },
+                    'expired-callback': function() {
+                        if (typeof window.onTurnstileExpired === 'function') {
+                            window.onTurnstileExpired();
+                        }
+                    },
+                    'error-callback': function() {
+                        if (typeof window.onTurnstileExpired === 'function') {
+                            window.onTurnstileExpired();
+                        }
+                    }
+                });
+                return 'render_ok';
+            } catch(e) {
+                return 'error: ' + e.message;
+            }
+        """)
+        log.info(f"  reset/render 结果: {reset_result}")
+        time.sleep(3)
+
+        # 再查一次状态
+        state = _get_widget_state()
+        log.info(f"  reset 后 widget 状态: {state}")
+
+    # 6) 主策略：监听 token input value + 按钮启用，最多 auto_timeout 秒
     log.info(f"  等待 Turnstile 自动通过 (最多 {auto_timeout}s)...")
-    try:
-        WebDriverWait(driver, auto_timeout).until(_submit_button_enabled)
-        log.info("  ✅ Turnstile 自动通过，提交按钮已启用")
-        return True
-    except TimeoutException:
-        log.info("  Turnstile 未自动通过，转为点击 checkbox")
+    deadline = time.time() + auto_timeout
+    last_log_time = time.time()
+    while time.time() < deadline:
+        # 检查 token 是否已生成
+        try:
+            token = driver.execute_script(
+                "var i = document.querySelector('input[name=\"cf-turnstile-response\"]');"
+                "return i ? i.value : '';"
+            )
+        except Exception:
+            token = ""
 
-    # 4) 兜底 A：点击 checkbox，最多重试 max_click_retries 次
-    for attempt in range(1, max_click_retries + 1):
-        # 每次重试前再等一下 iframe（之前可能没渲染好）
-        if attempt > 1:
-            log.info("  等待 Turnstile iframe 重新出现 (最多 15s)...")
+        if token and len(token) > 10:
+            log.info(f"  ✅ Turnstile token 已生成 (长度 {len(token)})")
+            # 启用提交按钮
             try:
-                WebDriverWait(driver, 15).until(
-                    lambda d: len(d.find_elements(By.CSS_SELECTOR,
-                                                  "div.cf-turnstile iframe")) > 0
-                    or len(d.find_elements(By.CSS_SELECTOR,
-                                           "iframe[src*='challenges.cloudflare.com']")) > 0
-                )
-            except TimeoutException:
-                log.info("  iframe 仍未出现，重试点击")
+                btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                driver.execute_script("arguments[0].disabled = false;", btn)
+                log.info("  ✅ 已强制启用提交按钮")
+            except Exception:
+                pass
+            return True
 
-        log.info(f"  尝试点击 Turnstile checkbox (第 {attempt}/{max_click_retries} 次)...")
-        clicked, status = _click_turnstile_checkbox(driver, log)
+        # 检查按钮是否已启用（onTurnstileSuccess 触发）
+        if _submit_button_enabled(driver):
+            log.info("  ✅ 提交按钮已启用 (onTurnstileSuccess 已触发)")
+            return True
 
-        if status == "success":
-            log.info("  ✅ 点击后 Turnstile 通过")
-            # 等提交按钮启用（onTurnstileSuccess 回调触发）
-            try:
-                WebDriverWait(driver, 5).until(_submit_button_enabled)
-                return True
-            except TimeoutException:
-                log.info("  Turnstile 通过但按钮未启用，JS 强制启用")
-                try:
-                    btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
-                    driver.execute_script("arguments[0].disabled = false;", btn)
-                    return True
-                except Exception:
-                    pass
+        # 每 10s 打印一次状态，方便诊断
+        if time.time() - last_log_time > 10:
+            cur_state = _get_widget_state()
+            elapsed = int(time.time() - (deadline - auto_timeout))
+            log.info(f"  [{elapsed}s] 等待中... token_len={cur_state.get('tokenLength', 0)}, "
+                     f"iframe={cur_state.get('iframeCount', 0)}, "
+                     f"total_iframes={cur_state.get('totalIframes', 0)}")
+            last_log_time = time.time()
 
-        if status in ("failed", "expired"):
-            log.info(f"  状态={status}，刷新后重试")
-            _refresh_turnstile(driver, log)
-            continue
-
-        if status == "no_iframe":
-            # iframe 还没渲染完，等一下再试
-            time.sleep(3)
-            continue
-
-        if status == "verifying_timeout":
-            # 验证中但超时，刷新重试
-            _refresh_turnstile(driver, log)
-            time.sleep(2)
-            continue
-
-        # click_error 等其他情况
-        _save_debug(driver, f"click_{status}")
         time.sleep(2)
 
-    # 4) 兜底 B：2captcha 外部打码
+    log.info(f"  Turnstile 自动通过超时 ({auto_timeout}s)")
+
+    # 7) 兜底 A：ActionChains 点击 iframe
+    state = _get_widget_state()
+    if state.get("iframeCount", 0) > 0 or state.get("totalIframes", 0) > 0:
+        log.info("  尝试 ActionChains 物理点击...")
+        for attempt in range(1, max_click_retries + 1):
+            log.info(f"  尝试点击 Turnstile checkbox (第 {attempt}/{max_click_retries} 次)...")
+            clicked, status = _click_turnstile_checkbox(driver, log)
+
+            if status == "success":
+                log.info("  ✅ 点击后 Turnstile 通过")
+                try:
+                    WebDriverWait(driver, 5).until(_submit_button_enabled)
+                    return True
+                except TimeoutException:
+                    log.info("  Turnstile 通过但按钮未启用，JS 强制启用")
+                    try:
+                        btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                        driver.execute_script("arguments[0].disabled = false;", btn)
+                        return True
+                    except Exception:
+                        pass
+
+            if status in ("failed", "expired"):
+                _refresh_turnstile(driver, log)
+                continue
+            if status == "no_iframe":
+                time.sleep(3)
+                continue
+            if status == "verifying_timeout":
+                _refresh_turnstile(driver, log)
+                time.sleep(2)
+                continue
+            _save_debug(driver, f"click_{status}")
+            time.sleep(2)
+    else:
+        log.info("  页面无 iframe, 跳过 ActionChains 点击")
+
+    # 8) 兜底 B：2captcha 外部打码
     if sitekey and TWOCAPTCHA_API_KEY:
         token = _solve_turnstile_with_2captcha(driver, log, sitekey, page_url)
         if token:
