@@ -1,59 +1,234 @@
+name: FOFA IP Update (WARP + Turnstile)
 
-name: Update Cloudflare DNS
- 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    - cron: "0 22 * * *"
   workflow_dispatch:
 
 jobs:
-  update-dns:
+  update_dns:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+    timeout-minutes: 30
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Commit Info
+        run: |
+          echo "当前 commit: $(git rev-parse HEAD)"
+          echo "当前分支: $(git branch --show-current || true)"
+          echo "当前目录: $(pwd)"
+          ls -la
+
+      - name: Check Script Exists
+        run: |
+          if [ ! -f "update_dns.py" ]; then
+            echo "❌ 未找到 update_dns.py"
+            exit 1
+          fi
+          echo "✅ 找到 update_dns.py"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install Chrome & Xvfb
+      - name: Install dependencies
         run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
-          sudo apt-get install -y google-chrome-stable xvfb
+          sudo apt-get install -y xvfb
+          python -m pip install --upgrade pip
+          pip install undetected-chromedriver requests beautifulsoup4
 
-      - name: Install Python dependencies
-        run: pip install requests beautifulsoup4 selenium undetected-chromedriver ddddocr Pillow
-
-      - name: Download cfst
+      - name: Setup WARP IPv6 Tunnel
         run: |
-          wget -N https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
-          tar -zxf cfst_linux_amd64.tar.gz
-          chmod +x cfst
-          ls -la
-          ./cfst -h || true
+          set +e
 
-      - name: Run DNS update script
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python update_dns.py 2>&1
+          echo "开始安装 Cloudflare WARP..."
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
+            sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | \
+            sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+          # 注册重试
+          for i in 1 2 3; do
+            echo "尝试注册 WARP (第 $i 次)..."
+            warp-cli --accept-tos registration new && break
+            warp-cli --accept-tos register && break
+            sleep 3
+          done
+
+          echo "设置 WARP 为 proxy 模式..."
+          warp-cli --accept-tos mode proxy || true
+
+          # 连接重试 + 健康检查
+          for i in 1 2 3 4 5; do
+            echo "尝试连接 WARP (第 $i 次)..."
+            warp-cli --accept-tos connect || true
+            sleep 8
+            if warp-cli --accept-tos status | grep -q "Connected"; then
+              echo "✅ WARP 已连接"
+              break
+            fi
+            echo "⚠️  WARP 未就绪, 继续重试"
+          done
+
+          echo "WARP 状态:"
+          warp-cli --accept-tos status || true
+
+          # 检查 40000 端口
+          echo "检查 WARP SOCKS5 端口 40000..."
+          for i in 1 2 3 4 5; do
+            if curl -4 -s --max-time 8 --socks5-hostname 127.0.0.1:40000 https://api.ipify.org; then
+              echo ""
+              echo "✅ WARP 40000 端口可用"
+              break
+            fi
+            echo "⚠️  WARP 40000 端口未就绪, 等待 5s 重试"
+            sleep 5
+          done
+
+          echo "WARP 步骤完成"
+
+      - name: Start Proxy Bridge (Optional)
         env:
-          FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
-          FOFA_PASSWORD: ${{ secrets.FOFA_PASSWORD }}
+          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
+        run: |
+          set +e
+
+          # 只在用户配置了 SOCKS5_PROXY 时才装 gost 桥接到 1080
+          # 没配置时, Chrome 直连 WARP 40000, 无需 gost
+          if [ -z "$SOCKS5_PROXY" ]; then
+            echo "未配置 SOCKS5_PROXY, Chrome 将直连 WARP 40000, 无需 gost"
+            exit 0
+          fi
+
+          echo "检测到 SOCKS5_PROXY, 启动 gost 桥接 (Chrome 1080 → 用户代理)"
+
+          GOST_OK=false
+          for URL in \
+            "https://ghproxy.net/https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" \
+            "https://ghproxy.com/https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" \
+            "https://mirror.ghproxy.com/https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" \
+            "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz"; do
+            echo "尝试下载 gost: $URL"
+            if wget -q --timeout=30 "$URL" -O gost.gz && gzip -t gost.gz 2>/dev/null; then
+              gzip -d gost.gz
+              chmod +x gost-linux-amd64-2.11.5
+              GOST_OK=true
+              echo "✅ gost 下载成功"
+              break
+            fi
+            echo "❌ 下载失败, 尝试下一个镜像"
+          done
+
+          if [ "$GOST_OK" != "true" ]; then
+            echo "❌ 所有 gost 镜像都失败, 将 fallback 到直连 WARP 40000"
+            exit 0
+          fi
+
+          nohup ./gost-linux-amd64-2.11.5 \
+            -L socks5://127.0.0.1:1080 \
+            -F "$SOCKS5_PROXY" > gost.log 2>&1 &
+
+          sleep 5
+
+          for i in 1 2 3 4 5; do
+            echo "代理健康检查 第 $i 次..."
+            if curl -4 -s --max-time 8 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org; then
+              echo ""
+              echo "✅ 1080 代理可用"
+              break
+            fi
+            echo "⚠️  1080 代理不通, 等待 5s 重试"
+            sleep 5
+          done
+
+          echo "gost 日志:"
+          tail -n 30 gost.log || true
+
+      - name: Check Network
+        env:
+          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
+        run: |
+          set +e
+          echo "=== 直连出口 IP (GitHub Actions 原生) ==="
+          curl -4 -s --max-time 10 https://api.ipify.org || true
+          echo ""
+          echo "=== WARP 40000 出口 IP ==="
+          curl -4 -s --max-time 10 --socks5-hostname 127.0.0.1:40000 https://api.ipify.org || echo "❌ 40000 不通"
+          echo ""
+          if [ ! -z "$SOCKS5_PROXY" ]; then
+            echo "=== gost 1080 出口 IP ==="
+            curl -4 -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org || echo "❌ 1080 不通"
+            echo ""
+          fi
+          echo "=== 检查 FOFA 登录页连通性 (走 WARP 40000) ==="
+          curl -I --max-time 20 --socks5-hostname 127.0.0.1:40000 https://i.nosec.org/login || true
+
+      - name: Run update_dns.py
+        env:
+          # 必填
           ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
-          CLOUDFLARE_DNS_NAME: us
+          FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
+          FOFA_PASSWORD: ${{ secrets.FOFA_PASSWORD }}
+          # 可选
+          CLOUDFLARE_DNS_NAME: ${{ secrets.CLOUDFLARE_DNS_NAME }}
+          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
+          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
+          # 标志位
+          GITHUB_ACTIONS: true
+          USE_XVFB: true
+          FORCE_PROXY: "true"
+        run: |
+          n=0
+          until [ "$n" -ge 3 ]; do
+            echo "=============================="
+            echo "开始执行任务，第 $((n+1)) 次"
+            echo "=============================="
 
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v5
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" python update_dns.py
+            code=$?
+
+            echo "脚本退出码: $code"
+            if [ "$code" -eq 0 ]; then
+              echo "任务成功"
+              break
+            fi
+
+            n=$((n+1))
+            if [ "$n" -ge 3 ]; then
+              echo "连续 3 次失败，不再重试"
+              break
+            fi
+
+            wait_time=$((60 + n * 60))
+            echo "任务失败，准备 ${wait_time}s 后重试... (当前失败次数: $n)"
+            sleep "$wait_time"
+          done
+
+          if [ "$n" -ge 3 ]; then
+            echo "最终失败"
+            exit 1
+          fi
+
+      - name: Upload Debug Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          name: debug-artifacts
+          name: debug-${{ github.run_id }}
           path: |
-            **/*.png
-            cf_speedtest.csv
-            cf_ips.txt
+            *.png
+            *.html
+            *.txt
+            *.log
           if-no-files-found: ignore
+          retention-days: 3
