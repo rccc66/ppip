@@ -90,9 +90,9 @@ Settings → Secrets and variables → Actions
 
 ---
 
-## 🛠 可自定义项
+## 🛠 可自定义项（所有自定义均推荐变量进行更换，不推荐直接修改代码）
 
-以下两项可以根据自己的需求修改（在 `update_dns.py` 顶部）：
+以下两项可以根据自己的需求修改（在 `update_dns.py` 顶部）推荐使用变量进行更换。：
 
 ### 1. PPIP 候选 IP 源域名
 
