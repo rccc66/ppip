@@ -8,7 +8,7 @@
 
 ## 📌 功能简介
 
-- ✅ 从 **PPIP** (`ppip.ishtq.de5.net`) 拉取候选 IP 列表
+- ✅ 从 **PPIP** 检测接口拉取候选 IP 列表
 - ✅ 并发调用 **PPIP Check API** 验证 IP 可用性（含出口信息）
 - ✅ 通过 **AbuseIPDB** 过滤纯净 IP（仅保留评分 `0` 的 IP）
 - ✅ 通过 **Cloudflare API** 自动添加 / 删除 DNS A 记录
@@ -38,9 +38,9 @@
 | `ABUSEIPDB_API_KEY` | ✅ | [AbuseIPDB](https://www.abuseipdb.com/) 的 API Key，用于查询 IP 纯净度 | `your_abuseipdb_api_key` |
 | `CLOUDFLARE_API_TOKEN` | ✅ | Cloudflare API Token（需 Zone.DNS 编辑权限） | `your_cloudflare_api_token` |
 | `CLOUDFLARE_ZONE_ID` | ✅ | Cloudflare 的 Zone ID | `your_zone_id` |
-| `CLOUDFLARE_DOMAIN` | ✅ | Cloudflare 托管的**根域名**（不是子域名） | `ppip.cc.cd` |
+| `CLOUDFLARE_DOMAIN` | ✅ | Cloudflare 托管的**根域名**（不是子域名） | `your-domain.com` |
 | `CLOUDFLARE_DNS_NAME` | ❌ | 子域名前缀，默认 `us` | `us` |
-| `PPIP_SOURCE_DOMAIN` | ❌ | PPIP 候选 IP 源域名，默认 `ProxyIP.US.CMLiussss.net` | `ProxyIP.US.CMLiussss.net` |
+| `PPIP_SOURCE_DOMAIN` | ❌ | PPIP 候选 IP 源域名 | `your-ppip-source-domain` |
 | `PPIP_CHECK_LIMIT` | ❌ | 检测的 IP 数量上限，默认 `30` | `30` |
 | `PPIP_CONCURRENCY` | ❌ | 并发数，默认 `5` | `5` |
 | `CFST_BINARY` | ❌ | CloudflareST 二进制路径，默认 `./cfst` | `./cfst` |
@@ -56,8 +56,8 @@ ABUSEIPDB_API_KEY=your_abuseipdb_api_key
 CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
 CLOUDFLARE_ZONE_ID=your_zone_id
 CLOUDFLARE_DNS_NAME=us
-CLOUDFLARE_DOMAIN=ppip.cc.cd
-PPIP_SOURCE_DOMAIN=ProxyIP.US.CMLiussss.net
+CLOUDFLARE_DOMAIN=your-domain.com
+PPIP_SOURCE_DOMAIN=your-ppip-source-domain
 PPIP_CHECK_LIMIT=30
 PPIP_CONCURRENCY=5
 ```
@@ -90,14 +90,14 @@ Settings → Secrets and variables → Actions
 
 ---
 
-## 🛠 可自定义项（所有自定义均推荐变量进行更换，不推荐直接修改代码）
+## 🛠 可自定义项
 
-以下两项可以根据自己的需求修改（在 `update_dns.py` 顶部）推荐使用变量进行更换。：
+以下两项可以根据自己的需求修改（在 `update_dns.py` 顶部）：
 
 ### 1. PPIP 候选 IP 源域名
 
 ```python
-PPIP_SOURCE_DOMAIN = os.getenv("PPIP_SOURCE_DOMAIN", "ProxyIP.US.CMLiussss.net")
+PPIP_SOURCE_DOMAIN = os.getenv("PPIP_SOURCE_DOMAIN", "your-ppip-source-domain")
 ```
 
 可替换为其它 PPIP 支持的源域名。
@@ -119,17 +119,17 @@ ABUSE_THRESHOLD = 0
 如果你要使用的完整域名是：
 
 ```text
-us.ppip.cc.cd
+us.your-domain.com
 ```
 
 那么配置应填写为：
 
 ```env
 CLOUDFLARE_DNS_NAME=us
-CLOUDFLARE_DOMAIN=ppip.cc.cd
+CLOUDFLARE_DOMAIN=your-domain.com
 ```
 
-> ⚠️ **重要**：`CLOUDFLARE_DOMAIN` 必须是 Cloudflare 上的 Zone 根域名，**不要**填子域名（如 `us.ppip.cc.cd`），否则会报 `DNS name is invalid (9000)` 错误。
+> ⚠️ **重要**：`CLOUDFLARE_DOMAIN` 必须是 Cloudflare 上的 Zone 根域名，**不要**填子域名（如 `us.your-domain.com`），否则会报 `DNS name is invalid (9000)` 错误。
 
 ---
 
@@ -215,8 +215,8 @@ chmod +x cfst
 
 `CLOUDFLARE_DOMAIN` 必须是根域名，不能是子域名。
 
-❌ 错误：`CLOUDFLARE_DOMAIN=us.ppip.cc.cd`
-✅ 正确：`CLOUDFLARE_DOMAIN=ppip.cc.cd`
+❌ 错误：`CLOUDFLARE_DOMAIN=us.your-domain.com`
+✅ 正确：`CLOUDFLARE_DOMAIN=your-domain.com`
 
 ### Q2: 报错 `Zone 不存在（404）`
 
