@@ -1,0 +1,2 @@
+undetected-webdriver
+requests==2.31.0
