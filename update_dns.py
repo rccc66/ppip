@@ -60,6 +60,14 @@ def create_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=zh-CN,zh;q=0.9")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    # 增强：让 uc 指纹更接近真实浏览器
+    options.add_argument("--disable-features=IsolateOrigins,site-per-process,AutomationControlled")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--start-maximized")
+    # 真实 UA（避免 uc 默认 UA 被 CF 识别）
+    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 
     # 关键：代理设置（仿照 Hohai 脚本 v6 策略）
     if os.getenv("GITHUB_ACTIONS") or os.getenv("FORCE_PROXY"):
@@ -479,85 +487,107 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
     log.info(f"  widget 初始状态: {state}")
 
     # 5) 如果 iframe 已存在但 token 还没生成，**不要 reset**（reset 会破坏已渲染的 iframe）
-    #    只在确实没有 iframe 且没有 token 时才尝试 reset
+    #    只在确实没有 iframe 且没有 token 时才尝试强制重新 render
     if (state.get("cfIframeCount", 0) == 0
             and state.get("widgetIframeCount", 0) == 0
             and not state.get("tokenValue")):
-        log.info("  全文档无 CF iframe 且无 token, 主动调 turnstile.reset()...")
+        log.info("  全文档无 CF iframe 且无 token, 强制重新 render widget...")
+        # 分两步：先 reset（如果失败再 render），因为 reset 后如果 iframe 还没出来
+        # 就直接清空 widget 内容 + 强制 render
         reset_result = driver.execute_script("""
             try {
                 var widget = document.querySelector('div.cf-turnstile');
                 if (!widget) return 'no_widget';
                 if (!window.turnstile) return 'no_turnstile_api';
 
-                // 找 widget ID
+                // 先尝试 reset
                 var inputs = document.querySelectorAll('input[id^="cf-chl-widget-"]');
                 var widgetId = null;
                 if (inputs.length > 0) {
                     widgetId = inputs[0].id.replace('_response', '');
                 }
-                if (!widgetId) {
-                    // 从 widget 自身找 data-turnstile-id 或直接拿 sitekey 重 render
-                    widgetId = widget.getAttribute('data-turnstile-id');
-                }
-
                 if (widgetId && window.turnstile.reset) {
                     try {
                         window.turnstile.reset(widgetId);
-                        return 'reset_ok: ' + widgetId;
-                    } catch(e1) {
-                        return 'reset_error: ' + e1.message;
-                    }
+                    } catch(e1) {}
                 }
 
-                // fallback: 重新 render
-                widget.innerHTML = '';
-                var sitekey = widget.getAttribute('data-sitekey');
-                var action = widget.getAttribute('data-action');
-                window.turnstile.render(widget, {
-                    sitekey: sitekey,
-                    action: action,
-                    callback: function(token) {
-                        var input = document.querySelector('input[name="cf-turnstile-response"]');
-                        if (!input) {
-                            input = document.createElement('input');
-                            input.type = 'hidden';
-                            input.name = 'cf-turnstile-response';
-                            var form = document.querySelector('form#login-form');
-                            if (form) form.appendChild(input);
-                        }
-                        input.value = token;
-                        if (typeof window.onTurnstileSuccess === 'function') {
-                            window.onTurnstileSuccess();
-                        }
-                    },
-                    'expired-callback': function() {
-                        if (typeof window.onTurnstileExpired === 'function') {
-                            window.onTurnstileExpired();
-                        }
-                    },
-                    'error-callback': function() {
-                        if (typeof window.onTurnstileExpired === 'function') {
-                            window.onTurnstileExpired();
-                        }
-                    }
-                });
-                return 'render_ok';
+                return {
+                    widgetId: widgetId,
+                    sitekey: widget.getAttribute('data-sitekey'),
+                    action: widget.getAttribute('data-action')
+                };
             } catch(e) {
-                return 'error: ' + e.message;
+                return {error: e.message};
             }
         """)
-        log.info(f"  reset/render 结果: {reset_result}")
+        log.info(f"  reset 结果: {reset_result}")
 
-        # reset 后给 Turnstile 充足时间重新加载 iframe（最多 15s）
-        log.info("  等待 CF iframe 重新加载 (最多 15s)...")
-        for _ in range(15):
-            time.sleep(1)
-            state = _get_widget_state()
-            if state.get("cfIframeCount", 0) > 0 or state.get("tokenValue"):
-                log.info(f"  iframe 已出现 / token 已生成")
-                break
-        log.info(f"  reset 后 widget 状态: {state}")
+        # 等 5s 看 reset 有没有效果
+        time.sleep(5)
+        state = _get_widget_state()
+        if state.get("cfIframeCount", 0) == 0 and not state.get("tokenValue"):
+            log.info("  reset 无效, 直接清空 widget + 强制 render...")
+            render_result = driver.execute_script("""
+                try {
+                    var widget = document.querySelector('div.cf-turnstile');
+                    if (!widget) return 'no_widget';
+                    if (!window.turnstile) return 'no_turnstile_api';
+                    if (!window.turnstile.render) return 'no_render_api';
+
+                    var sitekey = widget.getAttribute('data-sitekey');
+                    var action = widget.getAttribute('data-action');
+
+                    // 完全清空 widget 内部
+                    widget.innerHTML = '';
+
+                    // 强制重新 render
+                    var newWidgetId = window.turnstile.render(widget, {
+                        sitekey: sitekey,
+                        action: action,
+                        'error-callback': function() {
+                            if (typeof window.onTurnstileExpired === 'function') {
+                                window.onTurnstileExpired();
+                            }
+                        },
+                        'expired-callback': function() {
+                            if (typeof window.onTurnstileExpired === 'function') {
+                                window.onTurnstileExpired();
+                            }
+                        },
+                        callback: function(token) {
+                            var input = document.querySelector('input[name="cf-turnstile-response"]');
+                            if (!input) {
+                                input = document.createElement('input');
+                                input.type = 'hidden';
+                                input.name = 'cf-turnstile-response';
+                                var form = document.querySelector('form#login-form');
+                                if (form) form.appendChild(input);
+                            }
+                            input.value = token;
+                            if (typeof window.onTurnstileSuccess === 'function') {
+                                window.onTurnstileSuccess();
+                            }
+                        }
+                    });
+                    return 'render_ok: ' + newWidgetId;
+                } catch(e) {
+                    return 'error: ' + e.message;
+                }
+            """)
+            log.info(f"  强制 render 结果: {render_result}")
+
+            # render 后等 iframe 出现
+            log.info("  等待 CF iframe 渲染 (最多 20s)...")
+            for _ in range(20):
+                time.sleep(1)
+                state = _get_widget_state()
+                if state.get("cfIframeCount", 0) > 0 or state.get("tokenValue"):
+                    log.info(f"  iframe 已出现 / token 已生成")
+                    break
+            log.info(f"  render 后 widget 状态: {state}")
+        else:
+            log.info(f"  reset 生效, widget 状态: {state}")
 
     # 6) 主策略：监听 token + 按钮，最多 auto_timeout 秒
     log.info(f"  等待 Turnstile 自动通过 (最多 {auto_timeout}s)...")
