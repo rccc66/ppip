@@ -1,4 +1,4 @@
-name: FOFA IP Update (WARP + Turnstile)
+name: PPIP Auto Update DNS
 
 on:
   schedule:
@@ -8,18 +8,11 @@ on:
 jobs:
   update_dns:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Show Commit Info
-        run: |
-          echo "当前 commit: $(git rev-parse HEAD)"
-          echo "当前分支: $(git branch --show-current || true)"
-          echo "当前目录: $(pwd)"
-          ls -la
 
       - name: Check Script Exists
         run: |
@@ -41,157 +34,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Setup WARP IPv6 Tunnel
-        run: |
-          set +e
-
-          echo "开始安装 Cloudflare WARP..."
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
-            sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | \
-            sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-
-          # 注册重试
-          for i in 1 2 3; do
-            echo "尝试注册 WARP (第 $i 次)..."
-            warp-cli --accept-tos registration new && break
-            warp-cli --accept-tos register && break
-            sleep 3
-          done
-
-          echo "设置 WARP 为 proxy 模式..."
-          warp-cli --accept-tos mode proxy || true
-
-          # 连接重试 + 健康检查
-          for i in 1 2 3 4 5; do
-            echo "尝试连接 WARP (第 $i 次)..."
-            warp-cli --accept-tos connect || true
-            sleep 8
-            if warp-cli --accept-tos status | grep -q "Connected"; then
-              echo "✅ WARP 已连接"
-              break
-            fi
-            echo "⚠️  WARP 未就绪, 继续重试"
-          done
-
-          echo "WARP 状态:"
-          warp-cli --accept-tos status || true
-
-          # 检查 40000 端口
-          echo "检查 WARP SOCKS5 端口 40000..."
-          for i in 1 2 3 4 5; do
-            if curl -4 -s --max-time 8 --socks5-hostname 127.0.0.1:40000 https://api.ipify.org; then
-              echo ""
-              echo "✅ WARP 40000 端口可用"
-              break
-            fi
-            echo "⚠️  WARP 40000 端口未就绪, 等待 5s 重试"
-            sleep 5
-          done
-
-          echo "WARP 步骤完成"
-
-      - name: Start Proxy Bridge (Optional)
-        env:
-          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
-        run: |
-          set +e
-
-          # 只在用户配置了 SOCKS5_PROXY 时才装 gost 桥接到 1080
-          # 没配置时, Chrome 直连 WARP 40000, 无需 gost
-          if [ -z "$SOCKS5_PROXY" ]; then
-            echo "未配置 SOCKS5_PROXY, Chrome 将直连 WARP 40000, 无需 gost"
-            exit 0
-          fi
-
-          echo "检测到 SOCKS5_PROXY, 启动 gost 桥接 (Chrome 1080 → 用户代理)"
-
-          GOST_OK=false
-          for URL in \
-            "https://ghproxy.net/https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" \
-            "https://ghproxy.com/https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" \
-            "https://mirror.ghproxy.com/https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" \
-            "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz"; do
-            echo "尝试下载 gost: $URL"
-            if wget -q --timeout=30 "$URL" -O gost.gz && gzip -t gost.gz 2>/dev/null; then
-              gzip -d gost.gz
-              chmod +x gost-linux-amd64-2.11.5
-              GOST_OK=true
-              echo "✅ gost 下载成功"
-              break
-            fi
-            echo "❌ 下载失败, 尝试下一个镜像"
-          done
-
-          if [ "$GOST_OK" != "true" ]; then
-            echo "❌ 所有 gost 镜像都失败, 将 fallback 到直连 WARP 40000"
-            exit 0
-          fi
-
-          nohup ./gost-linux-amd64-2.11.5 \
-            -L socks5://127.0.0.1:1080 \
-            -F "$SOCKS5_PROXY" > gost.log 2>&1 &
-
-          sleep 5
-
-          for i in 1 2 3 4 5; do
-            echo "代理健康检查 第 $i 次..."
-            if curl -4 -s --max-time 8 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org; then
-              echo ""
-              echo "✅ 1080 代理可用"
-              break
-            fi
-            echo "⚠️  1080 代理不通, 等待 5s 重试"
-            sleep 5
-          done
-
-          echo "gost 日志:"
-          tail -n 30 gost.log || true
-
-      - name: Check Network
-        env:
-          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
-        run: |
-          set +e
-          echo "=== 直连出口 IP (GitHub Actions 原生) ==="
-          curl -4 -s --max-time 10 https://api.ipify.org || true
-          echo ""
-          echo "=== WARP 40000 出口 IP ==="
-          curl -4 -s --max-time 10 --socks5-hostname 127.0.0.1:40000 https://api.ipify.org || echo "❌ 40000 不通"
-          echo ""
-          if [ ! -z "$SOCKS5_PROXY" ]; then
-            echo "=== gost 1080 出口 IP ==="
-            curl -4 -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org || echo "❌ 1080 不通"
-            echo ""
-          fi
-          echo "=== 检查 FOFA 登录页连通性 (走 WARP 40000) ==="
-          curl -I --max-time 20 --socks5-hostname 127.0.0.1:40000 https://i.nosec.org/login || true
-
       - name: Run update_dns.py
         env:
-          # 必填（API 模式）
+          # 必填
           ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
-          FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
-          # 强烈推荐：Shodan API Key（免费，每月 100 次查询）
-          # 注册：https://www.shodan.io/dashboard
-          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
-          # 备选：FOFA API Key（需要 F 点）
-          FOFA_API_KEY: ${{ secrets.FOFA_API_KEY }}
-          # 可选：API 单次返回条数（默认 100，免费版上限 100）
-          FOFA_API_SIZE: ${{ secrets.FOFA_API_SIZE }}
-          # 可选（仅浏览器 fallback 需要）
-          FOFA_PASSWORD: ${{ secrets.FOFA_PASSWORD }}
-          # 其他可选
+          # 可选
           CLOUDFLARE_DNS_NAME: ${{ secrets.CLOUDFLARE_DNS_NAME }}
+          PPIP_SOURCE_DOMAIN: ${{ secrets.PPIP_SOURCE_DOMAIN }}
+          PPIP_CHECK_LIMIT: ${{ secrets.PPIP_CHECK_LIMIT }}
+          PPIP_CONCURRENCY: ${{ secrets.PPIP_CONCURRENCY }}
+          # 浏览器复检需要 WARP（check.proxyip.cmliussss.net 走 WARP）
           SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
-          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
-          # 标志位
           GITHUB_ACTIONS: true
           USE_XVFB: true
           FORCE_PROXY: "true"
@@ -218,50 +74,13 @@ jobs:
             fi
 
             wait_time=$((60 + n * 60))
-            echo "任务失败，准备 ${wait_time}s 后重试... (当前失败次数: $n)"
+            echo "任务失败，准备 ${wait_time}s 后重试..."
             sleep "$wait_time"
           done
 
           if [ "$n" -ge 3 ]; then
             echo "最终失败"
             exit 1
-          fi
-
-      - name: List Debug Files
-        if: always()
-        run: |
-          echo "=== 当前目录文件 ==="
-          ls -la
-          echo "=== debug/ 目录文件 ==="
-          ls -la debug/ 2>/dev/null || echo "无 debug 目录"
-
-      - name: Print Debug HTML (last final_fail) to log
-        if: always()
-        run: |
-          # 找最后一个 turnstile_final_fail 的 HTML，把内容直接打印到日志
-          # 这样不用下载 artifact 也能看到页面 DOM
-          LAST_HTML=$(ls -t debug/debug_turnstile_final_fail_*.html 2>/dev/null | head -1)
-          if [ -n "$LAST_HTML" ]; then
-            echo "================================================"
-            echo "页面 HTML 内容 ($LAST_HTML):"
-            echo "================================================"
-            cat "$LAST_HTML" | head -200
-            echo "================================================"
-          fi
-
-      - name: Print Debug iframe info to log
-        if: always()
-        run: |
-          # 找最后一个 final_fail 的 iframes.txt
-          LAST_IFRAMES=$(ls -t debug/debug_turnstile_final_fail_*.iframes.txt 2>/dev/null | head -1)
-          if [ -n "$LAST_IFRAMES" ]; then
-            echo "=== iframes.txt 内容 ==="
-            cat "$LAST_IFRAMES"
-          fi
-          LAST_CONSOLE=$(ls -t debug/debug_turnstile_final_fail_*.console.log 2>/dev/null | head -1)
-          if [ -n "$LAST_CONSOLE" ]; then
-            echo "=== console.log 内容 ==="
-            cat "$LAST_CONSOLE"
           fi
 
       - name: Upload Debug Artifacts
@@ -275,5 +94,6 @@ jobs:
             *.html
             *.txt
             *.log
+            *.csv
           if-no-files-found: ignore
           retention-days: 7
