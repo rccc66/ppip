@@ -3,11 +3,7 @@ os.environ["ORT_LOG_LEVEL"] = "ERROR"
 
 import re, time, json, base64, logging, subprocess, requests, urllib3, urllib.parse
 import shutil
-import ddddocr
 import undetected_chromedriver as uc
-from io import BytesIO
-from collections import Counter
-from PIL import Image, ImageFilter, ImageEnhance
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -16,7 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
-    StaleElementReferenceException,
+    NoSuchElementException,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -31,6 +27,8 @@ CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 FOFA_EMAIL = os.getenv("FOFA_EMAIL")
 FOFA_PASSWORD = os.getenv("FOFA_PASSWORD")
+# 可选：如果 Turnstile 自动通过失败，用 2captcha 兜底
+TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
 FOFA_QUERY = ('server=="cloudflare" && header="Forbidden" && country=="US" && '
               'port="443" && (asn=="31898" || asn=="16509" || asn=="14618" || asn=="8075")')
 PROXY_CHECK_URL = "https://check.proxyip.cmliussss.net"
@@ -39,67 +37,16 @@ CF_DNS_RECORDS_URL = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/d
 ABUSE_THRESHOLD = 20
 LOGIN_PAGE = "https://i.nosec.org/login?locale=zh-CN&service=https://fofa.info/f_login"
 
-# ---------- OCR ----------
-def preprocess_captcha(image_bytes):
-    img = Image.open(BytesIO(image_bytes))
-    candidates = []
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    candidates.append(buf.getvalue())
-
-    gray = img.convert("L")
-    enhanced = ImageEnhance.Contrast(gray).enhance(2.0)
-    bw = enhanced.point(lambda x: 255 if x > 128 else 0, "1")
-    buf = BytesIO(); bw.save(buf, format="PNG"); candidates.append(buf.getvalue())
-
-    sharp = gray.filter(ImageFilter.SHARPEN)
-    bw2 = sharp.point(lambda x: 255 if x > 100 else 0, "1")
-    buf = BytesIO(); bw2.save(buf, format="PNG"); candidates.append(buf.getvalue())
-
-    big = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
-    big_gray = big.convert("L")
-    big_enh = ImageEnhance.Contrast(big_gray).enhance(2.5)
-    big_bw = big_enh.point(lambda x: 255 if x > 120 else 0, "1")
-    buf = BytesIO(); big_bw.save(buf, format="PNG"); candidates.append(buf.getvalue())
-
-    median = gray.filter(ImageFilter.MedianFilter(3))
-    med_bw = median.point(lambda x: 255 if x > 130 else 0, "1")
-    buf = BytesIO(); med_bw.save(buf, format="PNG"); candidates.append(buf.getvalue())
-    return candidates
-
-def ocr_captcha(image_bytes):
-    ocr = ddddocr.DdddOcr(show_ad=False)
-    candidates = preprocess_captcha(image_bytes)
-    results = []
-    for img_data in candidates:
-        try:
-            txt = ocr.classification(img_data)
-            clean = re.sub(r'[^a-zA-Z]', '', txt).lower()
-            if 4 <= len(clean) <= 6:
-                results.append(clean[:5])
-        except:
-            continue
-    if not results:
-        return ""
-    best = Counter(results).most_common(1)[0][0]
-    log.info(f"  OCR 候选: {results} -> {best}")
-    return best
-
-# ---------- Chrome 驱动（已应用强制对齐修复） ----------
+# ---------- Chrome 驱动 ----------
 def create_driver():
-    """
-    强制对齐浏览器路径与驱动版本，避免 CI 环境多版本冲突。
-    """
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # 反自动化特征，避免被 FOFA/WAF 拦截
     options.add_argument("--disable-blink-features=AutomationControlled")
-    headless_mode = False  # 如需无头请改为 True
+    headless_mode = False  # 配合 xvfb-run，如需纯无头请改 True
 
-    # 1️⃣ 锁定具体的浏览器执行路径优先级
     browser_path = (shutil.which("google-chrome")
                     or shutil.which("google-chrome-stable")
                     or shutil.which("chromium-browser")
@@ -114,7 +61,6 @@ def create_driver():
         except Exception as e:
             log.info(f"获取版本失败: {e}")
 
-    # 2️⃣ 强制 uc 使用上述锁定的二进制文件，确保驱动与浏览器版本绝对匹配
     driver = uc.Chrome(
         options=options,
         browser_executable_path=browser_path,
@@ -124,47 +70,8 @@ def create_driver():
     return driver
 
 
-# ---------- 验证码处理（修复版） ----------
-CAPTCHA_IMG_SELECTORS = [
-    (By.ID, "captcha_image"),
-    (By.ID, "captchaImage"),
-    (By.CSS_SELECTOR, "img[id*='captcha']"),
-    (By.CSS_SELECTOR, "img.captcha"),
-    (By.CSS_SELECTOR, "img[alt*='captcha' i]"),
-    (By.XPATH, "//img[contains(@src,'captcha') or contains(@src,'rucaptcha')]"),
-]
-CAPTCHA_INPUT_SELECTORS = [
-    (By.NAME, "_rucaptcha"),
-    (By.NAME, "captcha"),
-    (By.ID, "captcha"),
-    (By.CSS_SELECTOR, "input[name*='captcha' i]"),
-]
-
-
-def _switch_to_captcha_iframe(driver):
-    """如果验证码在 iframe 里，切进去；否则什么都不做。"""
-    try:
-        iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        for fr in iframes:
-            try:
-                driver.switch_to.frame(fr)
-                found = driver.find_elements(
-                    By.CSS_SELECTOR,
-                    "img[id*='captcha'], img[src*='captcha'], img[src*='rucaptcha']",
-                )
-                if found:
-                    return True
-                driver.switch_to.default_content()
-            except Exception:
-                driver.switch_to.default_content()
-                continue
-    except Exception:
-        driver.switch_to.default_content()
-    return False
-
-
+# ---------- 调试工具 ----------
 def _save_debug(driver, tag):
-    """失败时保存截图和 HTML，方便事后排查页面结构变化。"""
     try:
         driver.save_screenshot(f"debug_{tag}_{int(time.time())}.png")
     except Exception:
@@ -177,113 +84,187 @@ def _save_debug(driver, tag):
         pass
 
 
-def handle_captcha(driver, ocr_fn, log):
+# ---------- Cloudflare Turnstile 处理 ----------
+def _submit_button_enabled(driver):
+    """提交按钮初始 disabled，onTurnstileSuccess 后会移除 disabled 属性。"""
+    try:
+        btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+        return btn.is_enabled() and not btn.get_attribute("disabled")
+    except NoSuchElementException:
+        return False
+    except WebDriverException:
+        return False
+
+
+def _solve_turnstile_with_2captcha(driver, log, sitekey, page_url):
+    """2captcha 兜底解 Turnstile。成功返回 token，失败返回 None。"""
+    if not TWOCAPTCHA_API_KEY:
+        log.info("  未配置 TWOCAPTCHA_API_KEY，跳过外部打码")
+        return None
+    log.info(f"  提交 2captcha 任务 (sitekey={sitekey}, url={page_url})")
+    try:
+        resp = requests.post(
+            "https://2captcha.com/in.php",
+            data={
+                "key": TWOCAPTCHA_API_KEY,
+                "method": "turnstile",
+                "sitekey": sitekey,
+                "pageurl": page_url,
+                "json": 1,
+            },
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("status") != 1:
+            log.info(f"  2captcha 提交失败: {data}")
+            return None
+        task_id = data["request"]
+        log.info(f"  2captcha 任务 ID: {task_id}")
+
+        for _ in range(30):
+            time.sleep(5)
+            r = requests.get(
+                "https://2captcha.com/res.php",
+                params={"key": TWOCAPTCHA_API_KEY, "action": "get", "id": task_id, "json": 1},
+                timeout=30,
+            )
+            d = r.json()
+            if d.get("status") == 1:
+                log.info("  2captcha 解出 token")
+                return d["request"]
+            if d.get("request") != "CAPCHA_NOT_READY":
+                log.info(f"  2captcha 失败: {d}")
+                return None
+        log.info("  2captcha 超时")
+        return None
+    except Exception as e:
+        log.info(f"  2captcha 异常: {type(e).__name__}: {str(e)[:200]}")
+        return None
+
+
+def _inject_turnstile_token(driver, token):
+    """把外部打码拿到的 token 注入页面并触发回调启用提交按钮。"""
+    try:
+        # Turnstile 默认会创建一个名为 cf-turnstile-response 的隐藏 input
+        driver.execute_script("""
+            var input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (!input) {
+                input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = 'cf-turnstile-response';
+                document.querySelector('form#login-form').appendChild(input);
+            }
+            input.value = arguments[0];
+            if (typeof window.onTurnstileSuccess === 'function') {
+                window.onTurnstileSuccess();
+            }
+        """, token)
+        return True
+    except Exception as e:
+        log.info(f"  注入 token 失败: {type(e).__name__}: {str(e)[:200]}")
+        return False
+
+
+def handle_turnstile(driver, log, auto_timeout=25):
     """
-    在已打开登录页的 driver 上完成验证码识别并填入。
+    FOFA 登录页使用 Cloudflare Turnstile 替代图片验证码。
+    策略：
+      1) 主：等 Turnstile managed 模式自动通过（uc + 真实指纹下常自动放行）
+      2) 兜底 A：手动点击 Turnstile 复选框 iframe
+      3) 兜底 B：2captcha 外部打码（需配置 TWOCAPTCHA_API_KEY）
     成功返回 True，失败返回 False。
     """
-    in_iframe = _switch_to_captcha_iframe(driver)
-    log.info(f"  验证码 iframe 模式: {in_iframe}")
-
-    # 1) 等元素可见（而非仅 present），避免 screenshot_as_png 抛空 Message
-    captcha_img = None
-    used_selector = None
-    for by, sel in CAPTCHA_IMG_SELECTORS:
-        try:
-            captcha_img = WebDriverWait(driver, 4).until(
-                EC.visibility_of_element_located((by, sel))
-            )
-            used_selector = (by, sel)
-            break
-        except TimeoutException:
-            continue
-        except Exception as e:
-            log.info(f"  selector {sel} 异常: {type(e).__name__}: {str(e)[:200]}")
-            continue
-
-    if captcha_img is None:
-        log.info("  找不到可见验证码图片，可能页面结构已变更或改用滑块验证")
-        _save_debug(driver, "no_captcha")
-        if in_iframe:
-            driver.switch_to.default_content()
-        return False
-
-    # 2) 再等一下确保图片渲染完（避免 zero-size screenshot）
+    # 1) 等待 Turnstile 组件渲染
     try:
-        WebDriverWait(driver, 3).until(
-            lambda d: captcha_img.size["width"] > 10 and captcha_img.size["height"] > 10
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.cf-turnstile"))
         )
+    except TimeoutException:
+        log.info("  未找到 Turnstile 组件，可能页面结构已变或已登录")
+        _save_debug(driver, "no_turnstile")
+        return False
+
+    # 取 sitekey 和 page_url，给兜底 B 用
+    sitekey = None
+    page_url = driver.current_url
+    try:
+        div = driver.find_element(By.CSS_SELECTOR, "div.cf-turnstile")
+        sitekey = div.get_attribute("data-sitekey")
     except Exception:
-        log.info(f"  验证码尺寸异常: {captcha_img.size}")
-        _save_debug(driver, "captcha_size")
-        if in_iframe:
-            driver.switch_to.default_content()
-        return False
+        pass
+    log.info(f"  Turnstile sitekey={sitekey}, page={page_url}")
 
-    # 3) 截图，分阶段捕获真正错误
+    # 2) 主策略：等提交按钮自动启用
+    log.info(f"  等待 Turnstile 自动通过 (最多 {auto_timeout}s)...")
     try:
-        captcha_bytes = captcha_img.screenshot_as_png
-    except StaleElementReferenceException:
-        log.info("  验证码元素已失效（DOM 刷新）")
-        if in_iframe:
-            driver.switch_to.default_content()
-        return False
-    except WebDriverException as e:
-        # 这就是原来 "Message: 空字符串 + stacktrace" 的真凶
-        log.info(f"  验证码截图失败 WebDriverException: "
-                 f"msg={str(e.msg)[:300]!r}, stack={str(e.stacktrace)[:300]}")
-        _save_debug(driver, "screenshot_fail")
-        if in_iframe:
-            driver.switch_to.default_content()
-        return False
-    except Exception as e:
-        log.info(f"  验证码截图未知异常: {type(e).__name__}: {str(e)[:300]}")
-        _save_debug(driver, "screenshot_unknown")
-        if in_iframe:
-            driver.switch_to.default_content()
-        return False
+        WebDriverWait(driver, auto_timeout).until(_submit_button_enabled)
+        log.info("  ✅ Turnstile 自动通过，提交按钮已启用")
+        return True
+    except TimeoutException:
+        log.info("  Turnstile 未自动通过")
+        _save_debug(driver, "turnstile_auto_fail")
 
-    # 4) OCR
+    # 3) 兜底 A：点击 Turnstile iframe 内复选框
+    log.info("  尝试点击 Turnstile 复选框...")
+    clicked = False
     try:
-        captcha_text = ocr_fn(captcha_bytes)
+        turnstile_div = driver.find_element(By.CSS_SELECTOR, "div.cf-turnstile")
+        # Turnstile 渲染后会在 .cf-turnstile 内注入 iframe
+        iframes = turnstile_div.find_elements(By.CSS_SELECTOR, "iframe")
+        # 也可能在文档别处
+        if not iframes:
+            iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
+        for iframe in iframes:
+            try:
+                driver.switch_to.frame(iframe)
+                for sel in [
+                    (By.CSS_SELECTOR, "input[type='checkbox']"),
+                    (By.CSS_SELECTOR, "label"),
+                    (By.CSS_SELECTOR, "#cf-turnstile-widget"),
+                    (By.CSS_SELECTOR, "body"),
+                ]:
+                    try:
+                        el = driver.find_element(*sel)
+                        el.click()
+                        clicked = True
+                        log.info(f"  在 iframe 内点击了 {sel}")
+                        break
+                    except Exception:
+                        continue
+                driver.switch_to.default_content()
+                if clicked:
+                    break
+            except Exception:
+                driver.switch_to.default_content()
+                continue
     except Exception as e:
-        log.info(f"  OCR 异常: {type(e).__name__}: {str(e)[:300]}")
-        if in_iframe:
-            driver.switch_to.default_content()
-        return False
-
-    log.info(f"  验证码识别: {captcha_text!r} (selector={used_selector})")
-    if len(captcha_text) < 4:
-        try:
-            captcha_img.click()  # 点击刷新
-            time.sleep(1)
-        except Exception:
-            pass
-        if in_iframe:
-            driver.switch_to.default_content()
-        return False
-
-    # 5) 找输入框，可能在 iframe 外
-    if in_iframe:
+        log.info(f"  点击 Turnstile 异常: {type(e).__name__}: {str(e)[:200]}")
         driver.switch_to.default_content()
 
-    captcha_input = None
-    for by, sel in CAPTCHA_INPUT_SELECTORS:
+    if clicked:
         try:
-            captcha_input = WebDriverWait(driver, 3).until(
-                EC.visibility_of_element_located((by, sel))
-            )
-            break
+            WebDriverWait(driver, 10).until(_submit_button_enabled)
+            log.info("  ✅ 点击后 Turnstile 通过")
+            return True
         except TimeoutException:
-            continue
-    if captcha_input is None:
-        log.info("  找不到验证码输入框")
-        _save_debug(driver, "no_input")
-        return False
+            log.info("  点击后仍未通过")
 
-    captcha_input.clear()
-    captcha_input.send_keys(captcha_text)
-    return True
+    # 4) 兜底 B：2captcha 外部打码
+    if sitekey:
+        token = _solve_turnstile_with_2captcha(driver, log, sitekey, page_url)
+        if token:
+            if _inject_turnstile_token(driver, token):
+                try:
+                    WebDriverWait(driver, 5).until(_submit_button_enabled)
+                    log.info("  ✅ 2captcha token 注入后提交按钮已启用")
+                    return True
+                except TimeoutException:
+                    log.info("  token 已注入但按钮未启用，尝试直接提交")
+                    return True  # 即使按钮没启用，token 已在表单里，提交时也会带上
+
+    log.info("  ❌ Turnstile 验证未通过")
+    _save_debug(driver, "turnstile_final_fail")
+    return False
 
 
 # ---------- FOFA 搜索 ----------
@@ -302,6 +283,7 @@ def fofa_search():
                 log.info("  ✅ 已登录")
                 break
 
+            # 填用户名密码
             try:
                 username_input = WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.NAME, "username"))
@@ -317,23 +299,28 @@ def fofa_search():
                 _save_debug(driver, "no_login_form")
                 continue
 
-            # ===== 验证码处理（修复版） =====
-            if not handle_captcha(driver, ocr_captcha, log):
+            # 处理 Cloudflare Turnstile（替代原图片验证码）
+            if not handle_turnstile(driver, log, auto_timeout=25):
+                time.sleep(1)
                 continue
 
+            # 勾选服务协议
             try:
                 checkbox = driver.find_element(By.ID, "fofa_service")
                 if not checkbox.is_selected():
                     driver.execute_script("arguments[0].click();", checkbox)
-            except:
+            except Exception:
                 pass
 
+            # 提交
             try:
                 submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                # JS 强制启用，万一 onTurnstileSuccess 没触发但 token 已注入
+                driver.execute_script("arguments[0].disabled = false;", submit_btn)
                 submit_btn.click()
                 time.sleep(5)
-            except:
-                pass
+            except Exception as e:
+                log.info(f"  提交异常: {type(e).__name__}: {str(e)[:200]}")
 
             log.info(f"  提交后 URL: {driver.current_url}")
 
@@ -343,7 +330,7 @@ def fofa_search():
                 break
 
             if "i.nosec.org" in driver.current_url:
-                log.info("  ❌ 验证码错误或登录失败")
+                log.info("  ❌ 登录失败（账号密码错误？或 Turnstile token 被拒）")
                 _save_debug(driver, "login_fail")
                 time.sleep(1)
 
