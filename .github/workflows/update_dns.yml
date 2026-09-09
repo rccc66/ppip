@@ -172,14 +172,19 @@ jobs:
 
       - name: Run update_dns.py
         env:
-          # 必填
+          # 必填（API 模式）
           ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
           FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
+          # 强烈推荐：FOFA API Key，绕过 Turnstile 浏览器登录
+          FOFA_API_KEY: ${{ secrets.FOFA_API_KEY }}
+          # 可选：API 单次返回条数（默认 100，免费版上限 100）
+          FOFA_API_SIZE: ${{ secrets.FOFA_API_SIZE }}
+          # 可选（仅浏览器 fallback 需要）
           FOFA_PASSWORD: ${{ secrets.FOFA_PASSWORD }}
-          # 可选
+          # 其他可选
           CLOUDFLARE_DNS_NAME: ${{ secrets.CLOUDFLARE_DNS_NAME }}
           SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
           TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
