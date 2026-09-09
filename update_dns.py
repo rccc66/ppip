@@ -19,7 +19,9 @@ log = logging.getLogger(__name__)
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CF_ZONE_ID = os.getenv("CLOUDFLARE_ZONE_ID")
-CF_DNS_NAME = os.getenv("CLOUDFLARE_DNS_NAME", "us")
+# 关键：os.getenv(name, default) 在 secret 存在但值为空时会返回空字符串，
+# 不是 default。需要手动 fallback。
+CF_DNS_NAME = (os.getenv("CLOUDFLARE_DNS_NAME") or "").strip() or "us"
 CF_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
 ABUSE_THRESHOLD = 20
 
