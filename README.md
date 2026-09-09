@@ -8,7 +8,7 @@
 
 ## 📌 功能简介
 
-- ✅ 从 **PPIP** 检测接口拉取候选 IP 列表
+- ✅ 从 **ProxyIP** 检测接口拉取候选 IP 列表
 - ✅ 并发调用 **ProxyIP Check API** 验证 IP 可用性（含出口信息）
 - ✅ 通过 **AbuseIPDB** 过滤纯净 IP（仅保留评分 `0` 的 IP）
 - ✅ 通过 **Cloudflare API** 自动添加 / 删除 DNS A 记录
