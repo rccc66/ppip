@@ -34,6 +34,11 @@ FOFA_API_KEY = os.getenv("FOFA_API_KEY", "")
 # FOFA API 用的 qbase64 是 base64 编码后的查询，size 限制 100-10000
 _fofa_api_size_raw = (os.getenv("FOFA_API_SIZE") or "").strip()
 FOFA_API_SIZE = int(_fofa_api_size_raw) if _fofa_api_size_raw else 100
+
+# Shodan API（方案 3：完全绕过 FOFA/Turnstile）
+# 免费注册：https://www.shodan.io/dashboard
+# 免费版每月 100 次查询，每天 1 次 workflow 完全够用
+SHODAN_API_KEY = os.getenv("SHODAN_API_KEY", "")
 # 可选：如果 Turnstile 自动通过失败，用 2captcha 兜底
 TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
 FOFA_QUERY = ('server=="cloudflare" && header="Forbidden" && country=="US" && '
@@ -950,6 +955,111 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
     return False
 
 
+# ---------- Shodan API（方案 3：完全绕过 FOFA） ----------
+def fofa_search_via_shodan():
+    """
+    通过 Shodan API 直接搜索 Cloudflare 反代 + Forbidden + US 的 IP。
+    替代 FOFA，完全不需要浏览器、Turnstile、F 点。
+
+    Shodan 免费版：
+      - 注册地址：https://www.shodan.io/dashboard
+      - 每月 100 次免费查询（每次返回最多 100 条）
+      - 每天 1 次 workflow 完全够用
+
+    Shodan 查询语法（与 FOFA 不同）：
+      - port:443                    端口 443
+      - country:US                  美国
+      - server:cloudflare           HTTP Server header 含 cloudflare
+      - http.status:403             HTTP 状态码 403 Forbidden
+      - http.html:"Forbidden"       响应 body 含 Forbidden
+      - org:"Cloudflare"            组织属于 Cloudflare
+      - asn:AS31898                 AS 号（Cloudflare Inc）
+
+    FOFA 原查询：
+      server=="cloudflare" && header="Forbidden" && country=="US" &&
+      port="443" && (asn=="31898" || asn=="16509" || asn=="14618" || asn=="8075")
+    """
+    if not SHODAN_API_KEY:
+        log.info("未配置 SHODAN_API_KEY，跳过 Shodan 模式")
+        return []
+
+    log.info("===== 使用 Shodan API 搜索 IP =====")
+
+    # Shodan REST API: GET /shodan/host/search
+    # 文档：https://developer.shodan.io/api
+    url = "https://api.shodan.io/shodan/host/search"
+
+    # 注意：Shodan 免费版最多返回 1 页（100 条）
+    # 查询条件尽量贴近 FOFA 原查询
+    query = (
+        'port:443 country:US '
+        'http.status:403 '
+        'server:cloudflare'
+    )
+    log.info(f"Shodan 查询: {query}")
+
+    params = {
+        "key": SHODAN_API_KEY,
+        "query": query,
+        "facets": "country,asn,org",
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "?"
+        body = e.response.text[:300] if e.response is not None else ""
+        log.error(f"❌ Shodan API HTTP {status_code}: {body}")
+        if status_code == 401:
+            log.error("  → API Key 无效或未授权")
+        elif status_code == 403:
+            log.error("  → 账号无权限或查询超过免费版额度")
+        elif status_code == 429:
+            log.error("  → 速率限制，请稍后重试")
+        return []
+    except Exception as e:
+        log.error(f"❌ Shodan API 异常: {type(e).__name__}: {str(e)[:300]}")
+        return []
+
+    if "error" in data:
+        log.error(f"❌ Shodan 返回错误: {data.get('error')}")
+        return []
+
+    matches = data.get("matches", [])
+    total = data.get("total", 0)
+    log.info(f"✅ Shodan 返回 {len(matches)} 条结果 (total={total})")
+
+    if not matches:
+        log.warning("Shodan 未返回任何 IP，可能查询条件太严格或额度已用完")
+        return []
+
+    # facets 信息（统计）
+    facets = data.get("facets", {})
+    if facets:
+        log.info("  分布统计:")
+        for facet_name, facet_list in facets.items():
+            log.info(f"    {facet_name}:")
+            for item in facet_list[:5]:
+                log.info(f"      {item.get('value')}: {item.get('count')}")
+
+    # 提取 IP（Shodan 返回的 match 字段里 ip_str 是 IP，org 是 AS 组织）
+    ips = []
+    cf_asns = {"AS31898", "AS16509", "AS14618", "AS8075"}  # Cloudflare AS
+    for m in matches:
+        ip = m.get("ip_str") or ""
+        if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+            continue
+        # 可选过滤：ASN 属于 Cloudflare（Shodan 返回的 asn 字段是数字，需要加 AS 前缀）
+        # 免费版不需要严格过滤 ASN，Cloudflare Server header 已经够了
+        ips.append(ip)
+
+    ips = list(dict.fromkeys(ips))  # 去重保序
+    log.info(f"提取到 {len(ips)} 个去重 IP")
+    return ips
+
+
 # ---------- FOFA API（推荐路径，绕过 Turnstile） ----------
 def fofa_search_via_api():
     """
@@ -1244,18 +1354,28 @@ def fofa_search_via_browser():
 # ---------- FOFA 搜索（调度入口：API 优先，浏览器兜底） ----------
 def fofa_search():
     """
-    调度入口：
-      1. 配置了 FOFA_API_KEY → 直接走 API（推荐，绕过 Turnstile）
-      2. API 不可用 / 失败 → 回退到浏览器自动化
+    调度入口（按优先级）：
+      1. SHODAN_API_KEY → Shodan API（最推荐，免费且不需要 Turnstile）
+      2. FOFA_API_KEY 且 F 点充足 → FOFA API
+      3. 都没有 → 回退到浏览器自动化（CF Turnstile 多半会失败）
     """
+    # 优先 Shodan
+    if SHODAN_API_KEY:
+        log.info("检测到 SHODAN_API_KEY, 优先使用 Shodan API")
+        ips = fofa_search_via_shodan()
+        if ips:
+            return ips
+        log.warning("⚠️ Shodan API 未返回 IP, 尝试其他方式")
+
+    # 其次 FOFA API
     if FOFA_API_KEY:
-        log.info("检测到 FOFA_API_KEY, 优先使用 FOFA API")
+        log.info("检测到 FOFA_API_KEY, 尝试 FOFA API")
         ips = fofa_search_via_api()
         if ips:
             return ips
         log.warning("⚠️ FOFA API 未返回 IP, 回退到浏览器自动化模式")
 
-    # 浏览器 fallback
+    # 浏览器 fallback（多半会因 Turnstile 失败）
     log.info("===== 使用浏览器模式搜索 IP =====")
     return fofa_search_via_browser()
 
@@ -1499,11 +1619,13 @@ def cleanup_failed_ips(ip_status):
                 log.info(f"❌ 删除失败 {r['content']}: {e}")
 
 def main():
+    import sys
     log.info("===== 第一步：从 FOFA 搜索 IP =====")
     ips = fofa_search()
     log.info(f"找到 {len(ips)} 个IP: {ips}")
     if not ips:
-        return
+        log.error("❌ 未获取到任何 IP，workflow 标记为失败")
+        sys.exit(1)
 
     log.info("===== 第二步：探测 CF 反代特征 =====")
     cf_ips = []
@@ -1516,7 +1638,8 @@ def main():
             log.info(f"  ❌ {ip}")
     log.info(f"CF 节点: {len(cf_ips)} 个")
     if not cf_ips:
-        return
+        log.error("❌ 未找到 CF 反代节点，workflow 标记为失败")
+        sys.exit(1)
 
     log.info("===== 第三步：AbuseIPDB 检测 =====")
     clean_ips = []
@@ -1530,7 +1653,8 @@ def main():
         except Exception as e:
             log.info(f"  {ip} 失败: {e}")
     if not clean_ips:
-        return
+        log.error("❌ 未找到干净 IP，workflow 标记为失败")
+        sys.exit(1)
 
     log.info("===== 第四步：添加 DNS =====")
     for ip in clean_ips:
