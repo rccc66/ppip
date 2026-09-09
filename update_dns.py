@@ -279,14 +279,68 @@ def _verify_proxy_working(driver):
 
 # ---------- 调试工具 ----------
 def _save_debug(driver, tag):
+    """保存截图+HTML+console日志到 debug/ 子目录，文件名带 tag 和时间戳。"""
+    import os
+    os.makedirs("debug", exist_ok=True)
+    ts = time.strftime("%H%M%S")
+    filename_base = f"debug/debug_{tag}_{ts}"
+
+    # 1) 截图
     try:
-        driver.save_screenshot(f"debug_{tag}_{int(time.time())}.png")
-    except Exception:
-        pass
+        driver.save_screenshot(f"{filename_base}.png")
+        log.info(f"  📸 截图已保存: {filename_base}.png")
+    except Exception as e:
+        log.info(f"  截图失败: {e}")
+
+    # 2) HTML
     try:
         html = driver.page_source or ""
-        with open(f"debug_{tag}_{int(time.time())}.html", "w", encoding="utf-8") as f:
+        with open(f"{filename_base}.html", "w", encoding="utf-8") as f:
             f.write(html)
+        log.info(f"  📄 HTML 已保存: {filename_base}.html")
+    except Exception as e:
+        log.info(f"  HTML 保存失败: {e}")
+
+    # 3) 当前 URL + 页面 title
+    try:
+        with open(f"{filename_base}.meta.txt", "w", encoding="utf-8") as f:
+            f.write(f"URL: {driver.current_url}\n")
+            f.write(f"Title: {driver.title}\n")
+            f.write(f"Tag: {tag}\n")
+            f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except Exception:
+        pass
+
+    # 4) 浏览器 console 日志
+    try:
+        logs = driver.get_log("browser")
+        if logs:
+            with open(f"{filename_base}.console.log", "w", encoding="utf-8") as f:
+                for entry in logs:
+                    f.write(f"[{entry.get('level', '?')}] "
+                            f"{entry.get('message', '')}\n")
+    except Exception:
+        pass
+
+    # 5) 列出当前页面所有 iframe 信息
+    try:
+        all_iframes_info = driver.execute_script("""
+            var iframes = document.querySelectorAll('iframe');
+            var info = [];
+            for (var i = 0; i < iframes.length; i++) {
+                var f = iframes[i];
+                info.push({
+                    index: i, id: f.id || '', name: f.name || '',
+                    src: (f.src || '').substring(0, 200),
+                    width: f.offsetWidth, height: f.offsetHeight
+                });
+            }
+            return info;
+        """)
+        with open(f"{filename_base}.iframes.txt", "w", encoding="utf-8") as f:
+            f.write(f"Total iframes on page: {len(all_iframes_info)}\n\n")
+            for ifr in all_iframes_info:
+                f.write(json.dumps(ifr, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
