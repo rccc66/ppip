@@ -586,102 +586,95 @@ def handle_turnstile(driver, log, auto_timeout=45, max_click_retries=3):
             and state.get("widgetIframeCount", 0) == 0
             and not state.get("tokenValue")):
         log.info("  全文档无 CF iframe 且无 token, 强制重新 render widget...")
-        # 分两步：先 reset（如果失败再 render），因为 reset 后如果 iframe 还没出来
-        # 就直接清空 widget 内容 + 强制 render
-        reset_result = driver.execute_script("""
+
+        # 关键：FOFA 用 Turbolinks 加载页面，第二次访问时 api.js 已缓存但 widget 是新的，
+        # api.js 不会自动 render 新 widget（console 会报 "Cannot find Widget" 警告）。
+        # 必须先用 turnstile.remove() 清理掉旧 widget ID，再调 turnstile.render() 用 DOM 节点
+        # （而不是 widgetId）作为参数，让 api.js 重新绑定。
+        render_result = driver.execute_script("""
             try {
                 var widget = document.querySelector('div.cf-turnstile');
                 if (!widget) return 'no_widget';
                 if (!window.turnstile) return 'no_turnstile_api';
+                if (!window.turnstile.render) return 'no_render_api';
 
-                // 先尝试 reset
-                var inputs = document.querySelectorAll('input[id^="cf-chl-widget-"]');
-                var widgetId = null;
-                if (inputs.length > 0) {
-                    widgetId = inputs[0].id.replace('_response', '');
-                }
-                if (widgetId && window.turnstile.reset) {
-                    try {
-                        window.turnstile.reset(widgetId);
-                    } catch(e1) {}
+                // 1) 用 turnstile.remove() 清理所有旧 widget（如果有 API）
+                if (window.turnstile.remove) {
+                    var inputs = document.querySelectorAll('input[id^="cf-chl-widget-"]');
+                    for (var i = 0; i < inputs.length; i++) {
+                        var oldId = inputs[i].id.replace('_response', '');
+                        try { window.turnstile.remove(oldId); } catch(e) {}
+                    }
                 }
 
-                return {
-                    widgetId: widgetId,
-                    sitekey: widget.getAttribute('data-sitekey'),
-                    action: widget.getAttribute('data-action')
-                };
+                // 2) 保留 widget 容器，清空内部 DOM（让 api.js 重建）
+                widget.innerHTML = '';
+
+                // 3) 用 DOM 节点直接调 render（不要用 widgetId）
+                var sitekey = widget.getAttribute('data-sitekey');
+                var action = widget.getAttribute('data-action');
+
+                var newWidgetId = window.turnstile.render(widget, {
+                    sitekey: sitekey,
+                    action: action,
+                    'error-callback': function() {
+                        if (typeof window.onTurnstileExpired === 'function') {
+                            window.onTurnstileExpired();
+                        }
+                    },
+                    'expired-callback': function() {
+                        if (typeof window.onTurnstileExpired === 'function') {
+                            window.onTurnstileExpired();
+                        }
+                    },
+                    callback: function(token) {
+                        var input = document.querySelector('input[name="cf-turnstile-response"]');
+                        if (!input) {
+                            input = document.createElement('input');
+                            input.type = 'hidden';
+                            input.name = 'cf-turnstile-response';
+                            var form = document.querySelector('form#login-form');
+                            if (form) form.appendChild(input);
+                        }
+                        input.value = token;
+                        if (typeof window.onTurnstileSuccess === 'function') {
+                            window.onTurnstileSuccess();
+                        }
+                    }
+                });
+                return 'render_ok: ' + newWidgetId;
             } catch(e) {
-                return {error: e.message};
+                return 'error: ' + e.message + ' | stack: ' + (e.stack || '').substring(0, 300);
             }
         """)
-        log.info(f"  reset 结果: {reset_result}")
+        log.info(f"  强制 render 结果: {render_result}")
 
-        # 等 5s 看 reset 有没有效果
-        time.sleep(5)
-        state = _get_widget_state()
+        # render 后等 iframe 出现
+        log.info("  等待 CF iframe 渲染 (最多 25s)...")
+        for i in range(25):
+            time.sleep(1)
+            state = _get_widget_state()
+            if state.get("cfIframeCount", 0) > 0 or state.get("tokenValue"):
+                log.info(f"  ✅ iframe 已出现 / token 已生成 (等了 {i+1}s)")
+                break
+        log.info(f"  render 后 widget 状态: {state}")
+
+        # 如果还是没 iframe，再打印一次 console 看具体错误
         if state.get("cfIframeCount", 0) == 0 and not state.get("tokenValue"):
-            log.info("  reset 无效, 直接清空 widget + 强制 render...")
-            render_result = driver.execute_script("""
-                try {
-                    var widget = document.querySelector('div.cf-turnstile');
-                    if (!widget) return 'no_widget';
-                    if (!window.turnstile) return 'no_turnstile_api';
-                    if (!window.turnstile.render) return 'no_render_api';
-
-                    var sitekey = widget.getAttribute('data-sitekey');
-                    var action = widget.getAttribute('data-action');
-
-                    // 完全清空 widget 内部
-                    widget.innerHTML = '';
-
-                    // 强制重新 render
-                    var newWidgetId = window.turnstile.render(widget, {
-                        sitekey: sitekey,
-                        action: action,
-                        'error-callback': function() {
-                            if (typeof window.onTurnstileExpired === 'function') {
-                                window.onTurnstileExpired();
-                            }
-                        },
-                        'expired-callback': function() {
-                            if (typeof window.onTurnstileExpired === 'function') {
-                                window.onTurnstileExpired();
-                            }
-                        },
-                        callback: function(token) {
-                            var input = document.querySelector('input[name="cf-turnstile-response"]');
-                            if (!input) {
-                                input = document.createElement('input');
-                                input.type = 'hidden';
-                                input.name = 'cf-turnstile-response';
-                                var form = document.querySelector('form#login-form');
-                                if (form) form.appendChild(input);
-                            }
-                            input.value = token;
-                            if (typeof window.onTurnstileSuccess === 'function') {
-                                window.onTurnstileSuccess();
-                            }
-                        }
-                    });
-                    return 'render_ok: ' + newWidgetId;
-                } catch(e) {
-                    return 'error: ' + e.message;
-                }
-            """)
-            log.info(f"  强制 render 结果: {render_result}")
-
-            # render 后等 iframe 出现
-            log.info("  等待 CF iframe 渲染 (最多 20s)...")
-            for _ in range(20):
-                time.sleep(1)
-                state = _get_widget_state()
-                if state.get("cfIframeCount", 0) > 0 or state.get("tokenValue"):
-                    log.info(f"  iframe 已出现 / token 已生成")
-                    break
-            log.info(f"  render 后 widget 状态: {state}")
-        else:
-            log.info(f"  reset 生效, widget 状态: {state}")
+            log.info("  render 后仍无 iframe, 抓取 console 日志诊断...")
+            try:
+                logs = driver.get_log("browser")
+                if logs:
+                    # 只打印新的日志（含 turnstile/cf 关键字的）
+                    recent = logs[-30:]
+                    for entry in recent:
+                        msg = entry.get('message', '')
+                        if any(kw in msg.lower() for kw in
+                               ['turnstile', 'cloudflare', 'cf-chl', 'challenge', 'error']):
+                            log.info(f"     [{entry.get('level', '?')}] {msg[:300]}")
+            except Exception:
+                pass
+            _save_debug(driver, "render_failed")
 
     # 6) 主策略：监听 token + 按钮，最多 auto_timeout 秒
     log.info(f"  等待 Turnstile 自动通过 (最多 {auto_timeout}s)...")
