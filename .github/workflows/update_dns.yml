@@ -53,6 +53,7 @@ jobs:
           PPIP_CONCURRENCY: ${{ secrets.PPIP_CONCURRENCY }}
           PPIP_CHECK_TIMEOUT: ${{ secrets.PPIP_CHECK_TIMEOUT }}
           PPIP_CHECK_RETRIES: ${{ secrets.PPIP_CHECK_RETRIES }}
+          PPIP_MAX_LATENCY_MS: ${{ secrets.PPIP_MAX_LATENCY_MS }}
           # 读取模式输入
           RUN_MODE: ${{ github.event.inputs.mode || 'full' }}
         run: |
