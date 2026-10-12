@@ -27,6 +27,9 @@ PPIP_CONCURRENCY = int((os.getenv("PPIP_CONCURRENCY") or "").strip() or "10")
 PPIP_CHECK_TIMEOUT = int((os.getenv("PPIP_CHECK_TIMEOUT") or "").strip() or "15")
 # 失败重试次数（避免瞬时网络抖动误删）
 PPIP_CHECK_RETRIES = int((os.getenv("PPIP_CHECK_RETRIES") or "").strip() or "1")
+# 延迟阈值（毫秒）：复检时延迟超过此值的 IP 也删除，0 表示不启用
+# 默认 50，可用 PPIP_MAX_LATENCY_MS 覆盖；设为 0 关闭延迟清理
+PPIP_MAX_LATENCY_MS = int((os.getenv("PPIP_MAX_LATENCY_MS") or "").strip() or "50")
 
 CFST_BINARY = os.getenv("CFST_BINARY", "./cfst")
 
@@ -288,26 +291,31 @@ def add_ips_to_dns(clean_ips):
 
 # ---------- 第五步：用 PPIP API 复检 IP ----------
 def verify_proxyips_via_api():
-    """调用 PPIP /check 复检所有 DNS 记录里的 IP，返回 {ip: 'valid'/'invalid'}"""
+    """调用 PPIP /check 复检所有 DNS 记录里的 IP。
+    返回 (ip_status, latency_map):
+      ip_status: {ip: 'valid'/'invalid'}
+      latency_map: {ip: latency_ms}
+    """
     log.info(f"===== 第五步：用 PPIP API 复检 IP =====")
-    # 注：PPIP /check 是直接探测 IP，不需要等 DNS 生效
 
     records = get_dns_records()
     if not records:
         log.info("无 DNS 记录")
-        return {}
+        return {}, {}
 
     all_ips = [r["content"] for r in records]
     log.info(f"复检 {len(all_ips)} 个 IP")
 
-    # 调 PPIP /check API（target 直接用 IP:443）
     targets = [f"{ip}:443" for ip in all_ips]
     valid_results = check_ips_via_ppip(targets, label="复检")
 
     valid_ips = {r["ip"] for r in valid_results}
+    latency_map = {r["ip"]: r.get("latency") for r in valid_results if r.get("latency") is not None}
+
     log.info(f"复检通过: {len(valid_ips)}/{len(all_ips)}")
 
-    return {ip: ("valid" if ip in valid_ips else "invalid") for ip in all_ips}
+    ip_status = {ip: ("valid" if ip in valid_ips else "invalid") for ip in all_ips}
+    return ip_status, latency_map
 
 
 # ---------- 第七步：CloudflareST 测速 ----------
@@ -363,19 +371,50 @@ def run_cloudflare_speedtest(valid_ips):
     return results
 
 
-# ---------- 第六步：清理失败 IP ----------
-def cleanup_failed_ips(ip_status):
+# ---------- 第六步：清理失败 + 高延迟 IP ----------
+def cleanup_failed_ips(ip_status, latency_map=None):
+    """清理失败 IP + 延迟超过 PPIP_MAX_LATENCY_MS 的 IP"""
+    latency_map = latency_map or {}
+
+    # 1) 收集失败 IP
     failed = [ip for ip, s in ip_status.items() if s == "invalid"]
-    if not failed:
+
+    # 2) 收集高延迟 IP
+    high_latency = []
+    if PPIP_MAX_LATENCY_MS > 0:
+        for ip, lat in latency_map.items():
+            if lat is not None and lat > PPIP_MAX_LATENCY_MS:
+                # 仅当 check 通过但延迟高时，加入清理列表
+                if ip_status.get(ip) == "valid":
+                    high_latency.append((ip, lat))
+
+    # 3) 合并去重
+    to_delete = set(failed) | {ip for ip, _ in high_latency}
+
+    if not to_delete:
+        log.info("===== 无需清理 =====")
         return
-    log.info(f"===== 清理 {len(failed)} 个失败 IP =====")
+
+    log.info(f"===== 清理 {len(to_delete)} 个 IP =====")
+    log.info(f"  失败: {len(failed)} 个")
+    log.info(f"  高延迟(>{PPIP_MAX_LATENCY_MS}ms): {len(high_latency)} 个")
+
+    if high_latency:
+        for ip, lat in high_latency[:10]:  # 只打印前 10 个避免刷屏
+            log.info(f"  高延迟示例: {ip} ({lat}ms)")
+        if len(high_latency) > 10:
+            log.info(f"  ... 还有 {len(high_latency)-10} 个高延迟 IP")
+
     records = get_dns_records()
+    deleted_count = 0
     for r in records:
-        if r["content"] in failed:
+        if r["content"] in to_delete:
             try:
                 delete_dns_record(r["id"], r["content"])
+                deleted_count += 1
             except Exception as e:
                 log.info(f"删除失败 {r['content']}: {e}")
+    log.info(f"已删除 {deleted_count} 个 DNS 记录")
 
 
 # ---------- 主流程 ----------
@@ -395,9 +434,9 @@ def run_cleanup_only():
         return
 
     log.info(f"===== 独立清理模式：复检 {len(records)} 个 DNS 记录 =====")
-    ip_status = verify_proxyips_via_api()
+    ip_status, latency_map = verify_proxyips_via_api()
     if ip_status:
-        cleanup_failed_ips(ip_status)
+        cleanup_failed_ips(ip_status, latency_map)
     log.info("===== 清理完毕 =====")
 
 
@@ -434,20 +473,22 @@ def main():
 
     # 关键：用 try/finally 保证即使复检异常，cleanup 也会执行
     ip_status = {}
+    latency_map = {}
     try:
-        ip_status = verify_proxyips_via_api()
+        ip_status, latency_map = verify_proxyips_via_api()
     except Exception as e:
         log.error(f"❌ 复检异常: {e}")
-        # 即使复检异常，仍尝试清理已知的失败 IP（用第二次独立 check）
         log.info("尝试独立清理流程...")
         try:
-            ip_status = verify_proxyips_via_api()
+            ip_status, latency_map = verify_proxyips_via_api()
         except Exception as e2:
             log.error(f"❌ 独立清理也失败: {e2}")
 
     if ip_status:
-        cleanup_failed_ips(ip_status)
-        valid_after_check = [ip for ip, s in ip_status.items() if s == "valid"]
+        cleanup_failed_ips(ip_status, latency_map)
+        # 测速只用通过 + 低延迟的 IP
+        valid_after_check = [ip for ip, s in ip_status.items() if s == "valid"
+                            and (not latency_map or latency_map.get(ip, 0) <= PPIP_MAX_LATENCY_MS)]
         run_cloudflare_speedtest(valid_after_check)
 
     log.info("===== 全部完毕 =====")
