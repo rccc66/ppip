@@ -4,11 +4,20 @@ on:
   schedule:
     - cron: "0 22 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式：full=完整流程 / cleanup=只清理旧失败记录'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - cleanup
 
 jobs:
   update_dns:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -42,14 +51,27 @@ jobs:
           PPIP_SOURCE_DOMAIN: ${{ secrets.PPIP_SOURCE_DOMAIN }}
           PPIP_CHECK_LIMIT: ${{ secrets.PPIP_CHECK_LIMIT }}
           PPIP_CONCURRENCY: ${{ secrets.PPIP_CONCURRENCY }}
+          PPIP_CHECK_TIMEOUT: ${{ secrets.PPIP_CHECK_TIMEOUT }}
+          PPIP_CHECK_RETRIES: ${{ secrets.PPIP_CHECK_RETRIES }}
+          # 读取模式输入
+          RUN_MODE: ${{ github.event.inputs.mode || 'full' }}
         run: |
+          # 决定子命令
+          if [ "$RUN_MODE" = "cleanup" ]; then
+            CMD="python update_dns.py cleanup"
+            echo "🧹 运行清理模式"
+          else
+            CMD="python update_dns.py"
+            echo "🚀 运行完整流程"
+          fi
+
           n=0
           until [ "$n" -ge 3 ]; do
             echo "=============================="
             echo "开始执行任务，第 $((n+1)) 次"
             echo "=============================="
 
-            python update_dns.py
+            $CMD
             code=$?
 
             echo "脚本退出码: $code"
