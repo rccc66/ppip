@@ -22,7 +22,11 @@ PPIP_RESOLVE_URL = "https://ppip.ishtq.de5.net/resolve"
 PPIP_CHECK_URL = "https://api.090227.xyz/check"
 PPIP_SOURCE_DOMAIN = os.getenv("PPIP_SOURCE_DOMAIN", "ProxyIP.US.CMLiussss.net")
 PPIP_CHECK_LIMIT = int((os.getenv("PPIP_CHECK_LIMIT") or "").strip() or "30")
-PPIP_CONCURRENCY = int((os.getenv("PPIP_CONCURRENCY") or "").strip() or "5")
+PPIP_CONCURRENCY = int((os.getenv("PPIP_CONCURRENCY") or "").strip() or "10")
+# 单次请求超时（秒）—— 30s 太长，200 个 IP / 5 并发 = 1200s 会超 workflow timeout
+PPIP_CHECK_TIMEOUT = int((os.getenv("PPIP_CHECK_TIMEOUT") or "").strip() or "15")
+# 失败重试次数（避免瞬时网络抖动误删）
+PPIP_CHECK_RETRIES = int((os.getenv("PPIP_CHECK_RETRIES") or "").strip() or "1")
 
 CFST_BINARY = os.getenv("CFST_BINARY", "./cfst")
 
@@ -97,29 +101,37 @@ def fetch_ips_from_ppip():
 
 # ---------- 第二步：批量验证 IP ----------
 def _check_one_ip(target):
-    """调用 PPIP /check 验证单个 IP，返回详情 dict 或 None"""
-    try:
-        r = requests.get(PPIP_CHECK_URL,
-                         params={"proxyip": target}, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("success"):
-            return None
-        ipv4 = data.get("probe_results", {}).get("ipv4", {})
-        if not ipv4.get("ok"):
-            return None
-        exit_info = ipv4.get("exit") or {}
-        return {
-            "target": target,
-            "ip": target.split(":")[0],
-            "exit_ip": exit_info.get("ip"),
-            "country": exit_info.get("country"),
-            "asOrganization": exit_info.get("asOrganization"),
-            "latency": data.get("responseTime"),
-            "colo": data.get("colo"),
-        }
-    except Exception:
-        return None
+    """调用 PPIP /check 验证单个 IP，返回详情 dict 或 None。失败重试 PPIP_CHECK_RETRIES 次。"""
+    last_err = None
+    for attempt in range(PPIP_CHECK_RETRIES + 1):
+        try:
+            r = requests.get(PPIP_CHECK_URL,
+                             params={"proxyip": target}, timeout=PPIP_CHECK_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("success"):
+                return None  # 明确失败，不重试
+            ipv4 = data.get("probe_results", {}).get("ipv4", {})
+            if not ipv4.get("ok"):
+                return None  # 明确失败，不重试
+            exit_info = ipv4.get("exit") or {}
+            return {
+                "target": target,
+                "ip": target.split(":")[0],
+                "exit_ip": exit_info.get("ip"),
+                "country": exit_info.get("country"),
+                "asOrganization": exit_info.get("asOrganization"),
+                "latency": data.get("responseTime"),
+                "colo": data.get("colo"),
+            }
+        except Exception as e:
+            last_err = e
+            # 网络异常/超时/429 等才重试；其它直接放弃
+            if attempt < PPIP_CHECK_RETRIES:
+                time.sleep(1)
+                continue
+    # 所有重试都失败
+    return None
 
 
 def check_ips_via_ppip(targets, label="第二步"):
@@ -233,10 +245,9 @@ def add_ips_to_dns(clean_ips):
 
 # ---------- 第五步：用 PPIP API 复检 IP ----------
 def verify_proxyips_via_api():
-    """等 DNS 生效后，再次调用 PPIP /check 复检所有 DNS 记录里的 IP"""
+    """调用 PPIP /check 复检所有 DNS 记录里的 IP，返回 {ip: 'valid'/'invalid'}"""
     log.info(f"===== 第五步：用 PPIP API 复检 IP =====")
-    log.info("等待 30 秒让 DNS 生效...")
-    time.sleep(30)
+    # 注：PPIP /check 是直接探测 IP，不需要等 DNS 生效
 
     records = get_dns_records()
     if not records:
@@ -244,7 +255,7 @@ def verify_proxyips_via_api():
         return {}
 
     all_ips = [r["content"] for r in records]
-    log.info(f"复检 {len(all_ips)} 个 IP: {all_ips[:5]}{'...' if len(all_ips) > 5 else ''}")
+    log.info(f"复检 {len(all_ips)} 个 IP")
 
     # 调 PPIP /check API（target 直接用 IP:443）
     targets = [f"{ip}:443" for ip in all_ips]
@@ -325,8 +336,34 @@ def cleanup_failed_ips(ip_status):
 
 
 # ---------- 主流程 ----------
+def run_cleanup_only():
+    """独立清理模式：只跑第五步复检 + 第六步清理，跳过 1-4 步。
+    用法：python update_dns.py cleanup
+    适合：之前 workflow 超时没清理干净的旧失败记录
+    """
+    import sys
+    if not _verify_cf_config():
+        log.error("❌ Cloudflare 配置校验失败")
+        sys.exit(1)
+
+    records = get_dns_records()
+    if not records:
+        log.info("无 DNS 记录可清理")
+        return
+
+    log.info(f"===== 独立清理模式：复检 {len(records)} 个 DNS 记录 =====")
+    ip_status = verify_proxyips_via_api()
+    if ip_status:
+        cleanup_failed_ips(ip_status)
+    log.info("===== 清理完毕 =====")
+
+
 def main():
     import sys
+    # 支持 `python update_dns.py cleanup` 子命令
+    if len(sys.argv) > 1 and sys.argv[1] == "cleanup":
+        return run_cleanup_only()
+
     if not _verify_cf_config():
         log.error("❌ Cloudflare 配置校验失败")
         sys.exit(1)
@@ -352,11 +389,23 @@ def main():
         sys.exit(1)
     log.info(f"成功添加 {len(added_ips)} 个 DNS 记录")
 
-    ip_status = verify_proxyips_via_api()
-    cleanup_failed_ips(ip_status)
+    # 关键：用 try/finally 保证即使复检异常，cleanup 也会执行
+    ip_status = {}
+    try:
+        ip_status = verify_proxyips_via_api()
+    except Exception as e:
+        log.error(f"❌ 复检异常: {e}")
+        # 即使复检异常，仍尝试清理已知的失败 IP（用第二次独立 check）
+        log.info("尝试独立清理流程...")
+        try:
+            ip_status = verify_proxyips_via_api()
+        except Exception as e2:
+            log.error(f"❌ 独立清理也失败: {e2}")
 
-    valid_after_check = [ip for ip, s in ip_status.items() if s == "valid"]
-    run_cloudflare_speedtest(valid_after_check)
+    if ip_status:
+        cleanup_failed_ips(ip_status)
+        valid_after_check = [ip for ip, s in ip_status.items() if s == "valid"]
+        run_cloudflare_speedtest(valid_after_check)
 
     log.info("===== 全部完毕 =====")
 
