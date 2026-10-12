@@ -188,22 +188,62 @@ def filter_clean_ips(valid_ips):
 
 
 # ---------- Cloudflare DNS 操作 ----------
+# 缓存现有 DNS IP 集合，避免每次 create_dns_record 都拉全部记录
+_DNS_IP_CACHE = None
+_DNS_CACHE_TIME = 0
+_DNS_CACHE_TTL = 60  # 缓存 60 秒
+
+
 def get_dns_records():
+    """获取所有 DNS A 记录（自动翻页，避免 >100 条被漏掉）"""
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    r = requests.get(CF_DNS_RECORDS_URL,
-                     headers={"Authorization": f"Bearer {CF_API_TOKEN}",
-                              "Content-Type": "application/json"},
-                     params={"type": "A", "name": fqdn}, timeout=15)
-    r.raise_for_status()
-    return r.json().get("result", [])
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}",
+               "Content-Type": "application/json"}
+    all_records = []
+    page = 1
+    per_page = 200  # Cloudflare API 最大允许 1000，用 200 安全
+    while True:
+        r = requests.get(CF_DNS_RECORDS_URL, headers=headers,
+                         params={"type": "A", "name": fqdn,
+                                 "page": page, "per_page": per_page},
+                         timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        records = data.get("result", [])
+        all_records.extend(records)
+        # 检查是否还有下一页
+        result_info = data.get("result_info", {})
+        total_pages = result_info.get("total_pages", 1)
+        if page >= total_pages or not records:
+            break
+        page += 1
+    return all_records
+
+
+def _get_existing_dns_ips():
+    """获取现有 DNS 记录的 IP 集合，带缓存避免每次添加都拉全表"""
+    global _DNS_IP_CACHE, _DNS_CACHE_TIME
+    now = time.time()
+    if _DNS_IP_CACHE is not None and (now - _DNS_CACHE_TIME) < _DNS_CACHE_TTL:
+        return _DNS_IP_CACHE
+    records = get_dns_records()
+    _DNS_IP_CACHE = {r["content"] for r in records if r.get("content")}
+    _DNS_CACHE_TIME = now
+    return _DNS_IP_CACHE
+
+
+def _invalidate_dns_cache():
+    """添加/删除后让缓存失效"""
+    global _DNS_IP_CACHE
+    _DNS_IP_CACHE = None
 
 
 def create_dns_record(ip):
+    existing = _get_existing_dns_ips()
+    if ip in existing:
+        log.info(f"IP {ip} 已存在")
+        return
     fqdn = f"{CF_DNS_NAME}.{CF_DOMAIN}"
-    for r in get_dns_records():
-        if r["content"] == ip:
-            log.info(f"IP {ip} 已存在")
-            return
     payload = {"type": "A", "name": fqdn, "content": ip,
                "ttl": 1, "proxied": False}
     r = requests.post(CF_DNS_RECORDS_URL,
@@ -218,6 +258,9 @@ def create_dns_record(ip):
             log.error(f"❌ 添加 {ip} 失败 HTTP {r.status_code}: {r.text[:300]}")
         r.raise_for_status()
     log.info(f"已添加 DNS: {fqdn} -> {ip}")
+    # 更新缓存
+    existing.add(ip)
+    _DNS_IP_CACHE = existing
 
 
 def delete_dns_record(rid, ip):
